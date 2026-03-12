@@ -649,7 +649,7 @@ where
             }
 
             // Build flashblock after receiving signal
-            let next_flashblocks_ctx = match self.build_next_flashblock(
+            let (next_flashblocks_ctx, confirmed_ids) = match self.build_next_flashblock(
                 &ctx,
                 &mut info,
                 &mut state,
@@ -658,7 +658,7 @@ where
                 &block_cancel,
                 &best_payload,
             ) {
-                Ok(Some(next_flashblocks_ctx)) => next_flashblocks_ctx,
+                Ok(Some(result)) => result,
                 Ok(None) => {
                     self.record_flashblocks_metrics(&ctx, &info, flashblocks_per_block, &span);
                     return Ok(());
@@ -676,6 +676,8 @@ where
             };
 
             ctx = ctx.with_extra_ctx(next_flashblocks_ctx);
+            // Confirm after the flashblock is fully built and published.
+            self.sidecar.confirm_executed(confirmed_ids);
         }
     }
 
@@ -692,7 +694,7 @@ where
         best_txs: &mut NextBestFlashblocksTxs<Pool>,
         block_cancel: &CancellationToken,
         best_payload: &BlockCell<OpBuiltPayload>,
-    ) -> eyre::Result<Option<FlashblocksExtraCtx>> {
+    ) -> eyre::Result<Option<(FlashblocksExtraCtx, Vec<String>)>> {
         let flashblock_index = ctx.flashblock_index();
         let mut target_gas_for_batch = ctx.extra_ctx.target_gas_for_batch;
         let mut target_da_for_batch = ctx.extra_ctx.target_da_for_batch;
@@ -819,15 +821,25 @@ where
             timestamp: ctx.timestamp(),
             gas_limit: target_gas_for_batch.saturating_sub(pool_gas_used),
             state_overrides,
+            confirmed_instance_ids: Vec::new(), // populated by SidecarClient::poll_transactions
         };
         let sidecar_poll = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(self.sidecar.poll_transactions(&poll_request))
         });
+        // Collect IDs of successfully executed sidecar XTs. Confirmation is
+        // deferred until after the flashblock is fully built and published so
+        // we don't confirm XTs that were never actually included on-chain.
+        let mut instance_ids_to_confirm: Vec<String> = Vec::new();
+
         match sidecar_poll {
             Ok(Some(external_txs)) if !external_txs.is_empty() => {
                 let sidecar_tx_count = external_txs.len();
                 let sidecar_required_count = external_txs.iter().filter(|tx| tx.required).count();
+                let instance_ids: Vec<String> = external_txs
+                    .iter()
+                    .filter_map(|tx| tx.instance_id.clone())
+                    .collect();
 
                 if let Err(err) = ctx.execute_sidecar_transactions(
                     info,
@@ -850,6 +862,8 @@ where
                     );
                     return Err(err).wrap_err("failed to execute sidecar transactions");
                 }
+
+                instance_ids_to_confirm = instance_ids;
             }
             Ok(_) => {}
             Err(err) => {
@@ -956,7 +970,7 @@ where
                     target_flashblocks = ctx.target_flashblock_count(),
                 );
 
-                Ok(Some(next_extra_ctx))
+                Ok(Some((next_extra_ctx, instance_ids_to_confirm)))
             }
         }
     }

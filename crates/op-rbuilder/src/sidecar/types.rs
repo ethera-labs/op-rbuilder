@@ -59,6 +59,12 @@ pub struct PollRequest {
     /// Optional state overrides representing the in-progress builder state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_overrides: Option<serde_json::Value>,
+
+    /// Instance IDs of cross-chain transactions successfully executed in the
+    /// previous flashblock. The sidecar removes these from its pending set,
+    /// implementing the "confirm back" step of the pull protocol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed_instance_ids: Vec<String>,
 }
 
 /// Response from the sidecar when polling for transactions.

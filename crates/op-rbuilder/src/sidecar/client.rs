@@ -5,6 +5,7 @@ use super::{
     types::{ExternalTransaction, PollRequest, PollResponse, SidecarError},
 };
 use reqwest::Client;
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -13,6 +14,9 @@ use tracing::{debug, trace, warn};
 pub struct SidecarClient {
     client: Client,
     config: SidecarConfig,
+    /// Instance IDs queued to be confirmed on the next poll. Populated after
+    /// a successful sidecar transaction execution, drained into each request.
+    pending_confirmations: std::sync::Arc<Mutex<Vec<String>>>,
 }
 
 impl SidecarClient {
@@ -24,7 +28,19 @@ impl SidecarClient {
             .build()
             .expect("failed to build HTTP client");
 
-        Self { client, config }
+        Self { client, config, pending_confirmations: Default::default() }
+    }
+
+    /// Record instance IDs of XTs successfully executed by the builder.
+    /// These will be sent to the sidecar on the next poll so it can remove
+    /// them from its pending set.
+    pub fn confirm_executed(&self, instance_ids: Vec<String>) {
+        if instance_ids.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_confirmations.lock() {
+            pending.extend(instance_ids);
+        }
     }
 
     /// Returns true if the sidecar integration is enabled.
@@ -52,6 +68,22 @@ impl SidecarClient {
         let url = format!("{}/transactions", self.config.endpoint);
         let mut retries = 0u32;
 
+        // Drain confirmations once before the first attempt. Retries (hold
+        // responses) reuse the same request object and don't re-drain.
+        let confirmed = self
+            .pending_confirmations
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        let request = if confirmed.is_empty() {
+            std::borrow::Cow::Borrowed(request)
+        } else {
+            let mut req = request.clone();
+            req.confirmed_instance_ids = confirmed;
+            std::borrow::Cow::Owned(req)
+        };
+        let request = &*request;
+
         loop {
             trace!(
                 target: "sidecar",
@@ -59,18 +91,33 @@ impl SidecarClient {
                 block_number = request.block_number,
                 flashblock_index = request.flashblock_index,
                 retry = retries,
+                confirmed = request.confirmed_instance_ids.len(),
                 "Polling sidecar"
             );
 
-            let response = self
-                .client
-                .post(&url)
-                .json(request)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<PollResponse>()
-                .await?;
+            // If the HTTP call fails, re-queue the confirmations so they are
+            // retried on the next poll. Sending duplicate confirmations is
+            // idempotent: the sidecar ignores IDs it no longer tracks.
+            let poll_result: Result<PollResponse, reqwest::Error> = async {
+                self.client
+                    .post(&url)
+                    .json(request)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<PollResponse>()
+                    .await
+            }
+            .await;
+            let response = match poll_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if !request.confirmed_instance_ids.is_empty() {
+                        self.confirm_executed(request.confirmed_instance_ids.to_vec());
+                    }
+                    return Err(e.into());
+                }
+            };
 
             if !response.hold {
                 if response.transactions.is_empty() {
