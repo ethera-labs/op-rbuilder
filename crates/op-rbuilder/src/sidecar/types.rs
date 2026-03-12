@@ -1,6 +1,6 @@
 //! Types for sidecar communication.
 
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{B256, Bytes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

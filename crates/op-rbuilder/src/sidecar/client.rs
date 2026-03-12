@@ -28,7 +28,11 @@ impl SidecarClient {
             .build()
             .expect("failed to build HTTP client");
 
-        Self { client, config, pending_confirmations: Default::default() }
+        Self {
+            client,
+            config,
+            pending_confirmations: Default::default(),
+        }
     }
 
     /// Record instance IDs of XTs successfully executed by the builder.

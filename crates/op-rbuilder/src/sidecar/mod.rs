@@ -5,10 +5,10 @@
 
 mod client;
 mod config;
-mod types;
 mod overrides;
+mod types;
 
 pub use client::SidecarClient;
 pub use config::SidecarConfig;
-pub use types::{ExternalTransaction, PollRequest, PollResponse, SidecarError};
 pub use overrides::build_state_overrides;
+pub use types::{ExternalTransaction, PollRequest, PollResponse, SidecarError};
