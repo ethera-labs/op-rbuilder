@@ -82,7 +82,7 @@ jobs:
             protobuf-compiler
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-      - uses: actions/checkout@v4 # must install git before checkout and set safe.directory after checkout because of container
+      - uses: actions/checkout@v6 # must install git before checkout and set safe.directory after checkout because of container
 
       - name: Build tdx-quote-provider binary
         run: |
@@ -91,7 +91,7 @@ jobs:
           cargo build --release --features=${{ matrix.features }} --target ${{ matrix.configs.target }} --package tdx-quote-provider
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tdx-quote-provider-${{ needs.extract-version.outputs.VERSION }}-${{ matrix.configs.target }}${{ matrix.features && '-' }}${{ matrix.features }}
           path: target/${{ matrix.configs.target }}/release/tdx-quote-provider
@@ -107,10 +107,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           merge-multiple: true
           path: artifacts
