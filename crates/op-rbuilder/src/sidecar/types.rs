@@ -44,7 +44,9 @@ pub struct PollRequest {
     /// Current block number being built.
     pub block_number: u64,
 
-    /// Index of the flashblock within the current block (0-indexed).
+    /// Flashblock number within the current block. Index 0 is the
+    /// forced-only fallback flashblock; sidecar XTs are requested on later
+    /// flashblocks.
     pub flashblock_index: u64,
 
     /// State root of the parent block.

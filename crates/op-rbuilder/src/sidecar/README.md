@@ -35,24 +35,32 @@ participating rollups.
 
 ### Pull Model (Flashblocks)
 
-The builder uses a **pull model** where it polls the sidecar at the start of each flashblock:
+The builder uses a **pull model** during flashblock construction. In the current implementation, it polls the sidecar
+after executing the flashblock's pool transactions so the request can include `state_overrides` that describe the
+in-progress builder state.
 
 1. Builder starts building a flashblock
-2. Builder calls `POST /transactions` to the sidecar
-3. Sidecar responds with either:
+2. Builder executes the normal flashblock flow (sequencer-forced work, builder logic, pool transactions)
+3. Builder derives `state_overrides` from the in-progress state and calls `POST /transactions`
+4. Sidecar responds with either:
     - `hold: true` - Builder should wait and retry
     - `hold: false` + transactions - Builder executes these transactions
     - `hold: false` + empty - No cross-chain transactions for this flashblock
+5. If transactions are returned, the builder executes them in the same flashblock
+
+`flashblock_index == 0` is reserved for the forced-only fallback flashblock. Sidecar XTs are only returned on
+subsequent flashblocks.
 
 ### Transaction Execution Order
 
-Within each flashblock, transactions are executed in this order:
+For sidecar-specific ordering, the important property is that **pool transactions execute before sidecar transactions**
+within a flashblock. The builder's normal sequencer and builder-specific flow still runs as usual.
 
 ```
-1. Sequencer transactions (from FCU attributes)
-2. Builder transactions (end-of-block builder payments)
-3. Sidecar transactions (cross-chain XTs)  ◄── This module
-4. Pool transactions (user mempool)
+1. Normal flashblock flow (sequencer-forced + builder-defined work)
+2. Pool transactions (user mempool)
+3. Sidecar poll with `state_overrides`
+4. Sidecar transactions (cross-chain XTs)  ◄── This module
 ```
 
 ## API
@@ -69,21 +77,32 @@ POST {sidecar_endpoint}/transactions
 {
     "chain_id": 11155420,
     "block_number": 12345,
-    "flashblock_index": 0,
+    "flashblock_index": 1,
     "state_root": "0x...",
     "timestamp": 1705123456,
-    "gas_limit": 30000000
+    "gas_limit": 30000000,
+    "state_overrides": {
+        "0x1234...": {
+            "nonce": "0x2",
+            "balance": "0xde0b6b3a7640000"
+        }
+    },
+    "confirmed_instance_ids": [
+        "abc123"
+    ]
 }
 ```
 
-| Field              | Type   | Description                                      |
-|--------------------|--------|--------------------------------------------------|
-| `chain_id`         | `u64`  | Chain ID of this rollup                          |
-| `block_number`     | `u64`  | Current block number being built                 |
-| `flashblock_index` | `u64`  | Index of flashblock within the block (0-indexed) |
-| `state_root`       | `B256` | State root of the parent block                   |
-| `timestamp`        | `u64`  | Timestamp of the block being built               |
-| `gas_limit`        | `u64`  | Gas limit available for this flashblock batch    |
+| Field                    | Type            | Description                                                                  |
+|--------------------------|-----------------|------------------------------------------------------------------------------|
+| `chain_id`               | `u64`           | Chain ID of this rollup                                                      |
+| `block_number`           | `u64`           | Current block number being built                                             |
+| `flashblock_index`       | `u64`           | Flashblock number within the block. `0` is the forced-only fallback block    |
+| `state_root`             | `B256`          | Parent-block state root used as the base snapshot                            |
+| `timestamp`              | `u64`           | Timestamp of the block being built                                           |
+| `gas_limit`              | `u64`           | Gas remaining for sidecar transactions in this flashblock                    |
+| `state_overrides`        | `object?`       | Builder-derived account/storage overrides describing pool-tx effects         |
+| `confirmed_instance_ids` | `array<string>` | XT instance IDs included in the previous flashblock and safe to drop pending |
 
 ### Response (Hold)
 
