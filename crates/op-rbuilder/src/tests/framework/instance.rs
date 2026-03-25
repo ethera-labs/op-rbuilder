@@ -1,16 +1,17 @@
 use crate::{
     args::OpRbuilderArgs,
     builders::{BuilderConfig, FlashblocksBuilder, PayloadBuilder, StandardBuilder},
+    ethera::{EtheraControlApiServer, EtheraEthApiServer, EtheraRpcExt},
     primitives::reth::engine_api_builder::OpEngineApiBuilder,
     revert_protection::{EthApiExtServer, RevertProtectionExt},
     tests::{
-        EngineApi, Ipc, TEE_DEBUG_ADDRESS, TransactionPoolObserver, builder_signer, create_test_db,
-        framework::driver::ChainDriver, get_available_port,
+        builder_signer, create_test_db, framework::driver::ChainDriver, get_available_port,
+        EngineApi, Ipc, TransactionPoolObserver, TEE_DEBUG_ADDRESS,
     },
     tx::FBPooledTransaction,
     tx_signer::Signer,
 };
-use alloy_primitives::{Address, B256, Bytes, hex, keccak256};
+use alloy_primitives::{hex, keccak256, Address, Bytes, B256};
 use alloy_provider::{Identity, ProviderBuilder, RootProvider};
 use clap::Parser;
 use core::{
@@ -40,8 +41,8 @@ use reth_node_builder::{NodeBuilder, NodeConfig};
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_cli::commands::Commands;
 use reth_optimism_node::{
-    OpNode,
     node::{OpAddOns, OpAddOnsBuilder, OpEngineValidatorBuilder, OpPoolBuilder},
+    OpNode,
 };
 use reth_optimism_rpc::OpEthApiBuilder;
 use reth_transaction_pool::{AllTransactionsEvents, TransactionPool};
@@ -113,6 +114,7 @@ impl LocalInstance {
             .expect("Failed to convert rollup args to builder config");
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
+        let xt_pool = builder_config.xt_pool.clone();
 
         let addons: OpAddOns<
             _,
@@ -138,6 +140,17 @@ impl LocalInstance {
             )
             .with_add_ons(addons)
             .extend_rpc_modules(move |ctx| {
+                let ethera_ext = EtheraRpcExt::new(
+                    xt_pool.clone(),
+                    ctx.pool().clone(),
+                    ctx.registry.eth_api().clone(),
+                );
+                let mut ethera_rpc = EtheraEthApiServer::into_rpc(ethera_ext.clone());
+                ethera_rpc
+                    .merge(EtheraControlApiServer::into_rpc(ethera_ext))
+                    .map_err(eyre::Report::from)?;
+                ctx.modules.add_or_replace_configured(ethera_rpc)?;
+
                 if args.enable_revert_protection {
                     tracing::info!("Revert protection enabled");
 

@@ -5,7 +5,7 @@ use alloy_primitives::{Address, Bytes, TxHash};
 use op_alloy_consensus::OpTxEnvelope;
 use parking_lot::RwLock;
 use reth_primitives_traits::SignedTransaction;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -56,9 +56,107 @@ struct XtReservation {
     status: XtEntryStatus,
 }
 
+#[derive(Debug, Clone)]
+struct XtInstance {
+    order: XtOrderKey,
+    entries: Vec<XtReservation>,
+    senders: Vec<Address>,
+}
+
+#[derive(Debug, Clone)]
+struct SenderNonceReservation {
+    instance_id: String,
+    tx_hash: TxHash,
+    status: XtEntryStatus,
+}
+
+#[derive(Debug, Default)]
+struct SenderReservations {
+    by_nonce: BTreeMap<u64, SenderNonceReservation>,
+    blocking_count: usize,
+}
+
 #[derive(Debug, Default)]
 struct XtPoolState {
-    by_instance: HashMap<String, Vec<XtReservation>>,
+    by_instance: HashMap<String, XtInstance>,
+    ordered_instances: BTreeSet<(XtOrderKey, String)>,
+    by_sender: HashMap<Address, SenderReservations>,
+}
+
+impl XtPoolState {
+    fn insert_instance(
+        &mut self,
+        instance_id: String,
+        order: XtOrderKey,
+        entries: Vec<XtReservation>,
+    ) {
+        let senders = unique_senders(&entries);
+        self.ordered_instances.insert((order, instance_id.clone()));
+        self.by_instance.insert(
+            instance_id,
+            XtInstance {
+                order,
+                entries,
+                senders,
+            },
+        );
+    }
+
+    fn remove_instance(&mut self, instance_id: &str) -> Option<XtInstance> {
+        let instance = self.by_instance.remove(instance_id)?;
+        self.ordered_instances
+            .remove(&(instance.order, instance_id.to_string()));
+        Some(instance)
+    }
+
+    fn rebuild_sender(&mut self, sender: Address) {
+        let mut reservations = SenderReservations::default();
+
+        for instance in self.by_instance.values() {
+            for entry in &instance.entries {
+                if entry.sender != sender || !entry.status.counts_for_pending() {
+                    continue;
+                }
+
+                let previous = reservations.by_nonce.insert(
+                    entry.nonce,
+                    SenderNonceReservation {
+                        instance_id: entry.instance_id.clone(),
+                        tx_hash: entry.tx_hash,
+                        status: entry.status,
+                    },
+                );
+                debug_assert!(
+                    previous
+                        .as_ref()
+                        .is_none_or(|existing| existing.tx_hash == entry.tx_hash),
+                    "multiple active XT reservations share the same sender nonce"
+                );
+            }
+        }
+
+        reservations.blocking_count = reservations
+            .by_nonce
+            .values()
+            .filter(|reservation| reservation.status.blocks_pool_tx())
+            .count();
+
+        if reservations.by_nonce.is_empty() {
+            self.by_sender.remove(&sender);
+        } else {
+            self.by_sender.insert(sender, reservations);
+        }
+    }
+
+    fn rebuild_senders<I>(&mut self, senders: I)
+    where
+        I: IntoIterator<Item = Address>,
+    {
+        let unique: BTreeSet<_> = senders.into_iter().collect();
+        for sender in unique {
+            self.rebuild_sender(sender);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +193,7 @@ impl XtPool {
         let mut state = self.inner.write();
         if let Some(existing) = state.by_instance.get(&request.instance_id) {
             let existing_xt = existing
+                .entries
                 .iter()
                 .filter(|entry| entry.phase == XtReservationPhase::Xt)
                 .cloned()
@@ -115,7 +214,9 @@ impl XtPool {
             }
         }
 
-        state.by_instance.insert(request.instance_id, reservations);
+        let senders = unique_senders(&reservations);
+        state.insert_instance(request.instance_id, request.order, reservations);
+        state.rebuild_senders(senders);
         Ok(())
     }
 
@@ -126,13 +227,9 @@ impl XtPool {
                 .by_instance
                 .get(&request.instance_id)
                 .ok_or_else(|| XtPoolError::UnknownInstance(request.instance_id.clone()))?;
-            let order = existing
-                .iter()
-                .find(|entry| entry.phase == XtReservationPhase::Xt)
-                .or_else(|| existing.first())
-                .map(|entry| entry.order)
-                .ok_or_else(|| XtPoolError::UnknownInstance(request.instance_id.clone()))?;
+            let order = existing.order;
             let existing_put_inbox = existing
+                .entries
                 .iter()
                 .filter(|entry| entry.phase == XtReservationPhase::PutInbox)
                 .cloned()
@@ -167,18 +264,27 @@ impl XtPool {
             .get_mut(&request.instance_id)
             .ok_or_else(|| XtPoolError::UnknownInstance(request.instance_id.clone()))?;
         if existing_put_inbox.is_empty() {
-            entries.extend(released_put_inbox);
+            let mut updated_entries = released_put_inbox;
+            updated_entries.append(&mut entries.entries);
+            entries.entries = updated_entries;
         }
-        for entry in entries {
+        for entry in &mut entries.entries {
             if entry.phase == XtReservationPhase::Xt && entry.status == XtEntryStatus::Locked {
                 entry.status = XtEntryStatus::Released;
             }
         }
+        entries.senders = unique_senders(&entries.entries);
+        let senders = entries.senders.clone();
+        state.rebuild_senders(senders);
         Ok(())
     }
 
     pub fn abort(&self, instance_id: &str) {
-        self.inner.write().by_instance.remove(instance_id);
+        let mut state = self.inner.write();
+        let Some(instance) = state.remove_instance(instance_id) else {
+            return;
+        };
+        state.rebuild_senders(instance.senders);
     }
 
     pub fn mark_included(&self, instance_ids: &[String]) {
@@ -186,84 +292,100 @@ impl XtPool {
             return;
         }
 
-        let ids: BTreeSet<&str> = instance_ids.iter().map(String::as_str).collect();
         let mut state = self.inner.write();
-        for (instance_id, entries) in &mut state.by_instance {
-            if !ids.contains(instance_id.as_str()) {
+        let mut touched_senders = BTreeSet::new();
+        for instance_id in instance_ids {
+            let Some(instance) = state.by_instance.get_mut(instance_id) else {
                 continue;
-            }
-            for entry in entries {
+            };
+
+            for entry in &mut instance.entries {
                 if entry.status == XtEntryStatus::Released {
                     entry.status = XtEntryStatus::Included;
                 }
             }
+            touched_senders.extend(instance.senders.iter().copied());
         }
+        state.rebuild_senders(touched_senders);
     }
 
     pub fn prune_confirmed_sender(&self, sender: Address, on_chain_nonce: u64) {
         let mut state = self.inner.write();
-        state.by_instance.retain(|_, entries| {
-            entries.retain(|entry| !(entry.sender == sender && entry.nonce < on_chain_nonce));
-            !entries.is_empty()
-        });
+        let instance_ids = state.by_instance.keys().cloned().collect::<Vec<_>>();
+        for instance_id in instance_ids {
+            let mut remove_instance = false;
+            let mut order = None;
+
+            if let Some(instance) = state.by_instance.get_mut(&instance_id) {
+                let len_before = instance.entries.len();
+                instance
+                    .entries
+                    .retain(|entry| !(entry.sender == sender && entry.nonce < on_chain_nonce));
+                if instance.entries.len() == len_before {
+                    continue;
+                }
+
+                if instance.entries.is_empty() {
+                    remove_instance = true;
+                    order = Some(instance.order);
+                } else {
+                    instance.senders = unique_senders(&instance.entries);
+                }
+            }
+
+            if remove_instance {
+                let _ = state.by_instance.remove(&instance_id);
+                if let Some(order) = order {
+                    state.ordered_instances.remove(&(order, instance_id));
+                }
+            }
+        }
+        state.rebuild_sender(sender);
     }
 
     pub fn active_senders(&self) -> Vec<Address> {
-        let mut senders = BTreeSet::new();
-        for entry in self
+        let mut senders = self
             .inner
             .read()
-            .by_instance
-            .values()
-            .flatten()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    XtEntryStatus::Locked | XtEntryStatus::Released
-                )
-            })
-        {
-            senders.insert(entry.sender);
-        }
-        senders.into_iter().collect()
+            .by_sender
+            .iter()
+            .filter(|(_, reservations)| reservations.blocking_count > 0)
+            .map(|(sender, _)| *sender)
+            .collect::<Vec<_>>();
+        senders.sort();
+        senders
     }
 
     pub fn has_reserved_nonce(&self, sender: Address, nonce: u64) -> bool {
         self.inner
             .read()
-            .by_instance
-            .values()
-            .flatten()
-            .any(|entry| entry.sender == sender && entry.nonce == nonce && entry.status.reserves_nonce())
+            .by_sender
+            .get(&sender)
+            .and_then(|reservations| reservations.by_nonce.get(&nonce))
+            .is_some_and(|reservation| reservation.status.reserves_nonce())
     }
 
     pub fn has_blocking_nonce(&self, sender: Address, nonce: u64) -> bool {
         self.inner
             .read()
-            .by_instance
-            .values()
-            .flatten()
-            .any(|entry| {
-                entry.sender == sender && entry.nonce == nonce && entry.status.blocks_pool_tx()
-            })
+            .by_sender
+            .get(&sender)
+            .and_then(|reservations| reservations.by_nonce.get(&nonce))
+            .is_some_and(|reservation| reservation.status.blocks_pool_tx())
     }
 
     pub fn projected_next_nonce(&self, sender: Address, start_nonce: u64) -> u64 {
         let mut next_nonce = start_nonce;
         let state = self.inner.read();
-        let mut reservations = state
-            .by_instance
-            .values()
-            .flatten()
-            .filter(|entry| entry.sender == sender && entry.status.counts_for_pending())
-            .collect::<Vec<_>>();
-        reservations.sort_by_key(|entry| entry.nonce);
+        let Some(reservations) = state.by_sender.get(&sender) else {
+            return next_nonce;
+        };
 
-        for entry in reservations {
-            if entry.nonce < next_nonce {
+        for (&nonce, reservation) in reservations.by_nonce.range(next_nonce..) {
+            if !reservation.status.counts_for_pending() {
                 continue;
             }
-            if entry.nonce > next_nonce {
+            if nonce > next_nonce {
                 break;
             }
             next_nonce = next_nonce.saturating_add(1);
@@ -276,49 +398,20 @@ impl XtPool {
         &self,
         current_nonces: &HashMap<Address, u64>,
     ) -> Vec<ExecutableXtInstance> {
-        let mut entries = self
-            .inner
-            .read()
-            .by_instance
-            .values()
-            .flatten()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    XtEntryStatus::Locked | XtEntryStatus::Released
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        entries.sort_by(|a, b| {
-            (a.order, a.instance_id.as_str(), a.phase, a.tx_index).cmp(&(
-                b.order,
-                b.instance_id.as_str(),
-                b.phase,
-                b.tx_index,
-            ))
-        });
-
-        let mut grouped = Vec::<(String, Vec<XtReservation>)>::new();
-        for entry in entries {
-            match grouped.last_mut() {
-                Some((instance_id, instance_entries)) if *instance_id == entry.instance_id => {
-                    instance_entries.push(entry);
-                }
-                _ => grouped.push((entry.instance_id.clone(), vec![entry])),
-            }
-        }
-
+        let state = self.inner.read();
         let mut expected = current_nonces.clone();
         let mut executable = Vec::new();
 
-        for (instance_id, instance_entries) in grouped {
+        for (_, instance_id) in &state.ordered_instances {
+            let Some(instance) = state.by_instance.get(instance_id) else {
+                continue;
+            };
+
             let mut instance_expected = expected.clone();
-            let mut transactions = Vec::with_capacity(instance_entries.len());
+            let mut transactions = Vec::with_capacity(instance.entries.len());
             let mut executable_instance = true;
 
-            for entry in &instance_entries {
+            for entry in &instance.entries {
                 let Some(current_nonce) = instance_expected.get_mut(&entry.sender) else {
                     executable_instance = false;
                     break;
@@ -343,17 +436,10 @@ impl XtPool {
 
             expected = instance_expected;
 
-            let mut senders: Vec<Address> = Vec::new();
-            for entry in &instance_entries {
-                if !senders.contains(&entry.sender) {
-                    senders.push(entry.sender);
-                }
-            }
-
             executable.push(ExecutableXtInstance {
-                instance_id,
+                instance_id: instance_id.clone(),
                 transactions,
-                senders,
+                senders: instance.senders.clone(),
             });
         }
 
@@ -399,22 +485,12 @@ fn conflicts_with_pending(
     reservation: &XtReservation,
 ) -> bool {
     state
-        .by_instance
-        .iter()
-        .flat_map(|(existing_instance_id, entries)| {
-            entries
-                .iter()
-                .filter(move |entry| entry.status.counts_for_pending())
-                .map(move |entry| (existing_instance_id.as_str(), entry))
-        })
-        .any(|(existing_instance_id, entry)| {
-            if existing_instance_id == instance_id && entry.tx_hash == reservation.tx_hash {
-                return false;
-            }
-
-            entry.sender == reservation.sender
-                && entry.nonce == reservation.nonce
-                && entry.tx_hash != reservation.tx_hash
+        .by_sender
+        .get(&reservation.sender)
+        .and_then(|reservations| reservations.by_nonce.get(&reservation.nonce))
+        .is_some_and(|existing| {
+            existing.status.counts_for_pending()
+                && !(existing.instance_id == instance_id && existing.tx_hash == reservation.tx_hash)
         })
 }
 
@@ -428,6 +504,19 @@ fn same_reservations(existing: &[XtReservation], incoming: &[XtReservation]) -> 
                 && left.phase == right.phase
                 && left.tx_index == right.tx_index
         })
+}
+
+fn unique_senders(entries: &[XtReservation]) -> Vec<Address> {
+    let mut seen = BTreeSet::new();
+    let mut senders = Vec::new();
+
+    for entry in entries {
+        if seen.insert(entry.sender) {
+            senders.push(entry.sender);
+        }
+    }
+
+    senders
 }
 
 #[cfg(test)]
