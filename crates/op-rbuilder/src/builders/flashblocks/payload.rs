@@ -844,8 +844,52 @@ where
                         self.config
                             .xt_pool
                             .mark_included(std::slice::from_ref(&xt_instance.instance_id));
-                        instance_ids_to_confirm.push(xt_instance.instance_id);
+                        instance_ids_to_confirm.push(xt_instance.instance_id.clone());
                         made_progress = true;
+
+                        // Ethera: drain pool txs from XT senders that are now unblocked.
+                        // The pool uses canonical chain nonces so txs whose nonce just became
+                        // reachable due to this XT executing mid-block appear "queued" (not
+                        // "pending") and won't be returned by best_transactions_with_attributes.
+                        // Executing them here keeps the nonce chain live so the next XT in this
+                        // sender's sequence can execute within the same flashblock.
+                        let gas_limit =
+                            target_gas_for_batch.min(ctx.block_gas_limit());
+                        for &sender in &xt_instance.senders {
+                            let evm_nonce = state
+                                .load_cache_account(sender)
+                                .map(|acct| acct.account_info().unwrap_or_default().nonce)
+                                .map_err(|_| {
+                                    PayloadBuilderError::other(
+                                        OpPayloadBuilderError::AccountLoadFailed(sender),
+                                    )
+                                })?;
+
+                            let mut queued =
+                                self.pool.get_queued_transactions_by_sender(sender);
+                            queued.sort_by_key(|tx| tx.nonce());
+                            let consecutive: Vec<_> = queued
+                                .into_iter()
+                                .scan(evm_nonce, |expected, tx| {
+                                    if tx.nonce() == *expected {
+                                        *expected += 1;
+                                        Some(tx)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            let committed = ctx.execute_unblocked_pool_txs(
+                                info,
+                                state,
+                                &consecutive,
+                                gas_limit,
+                            )?;
+                            if !committed.is_empty() {
+                                best_txs.mark_commited(committed);
+                            }
+                        }
                     }
                 }
             }

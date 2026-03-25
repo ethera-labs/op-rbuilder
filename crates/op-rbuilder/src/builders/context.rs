@@ -2,7 +2,7 @@ use alloy_consensus::{Eip658Value, Transaction, conditional::BlockConditionalAtt
 use alloy_eips::{Decodable2718, Encodable2718, Typed2718};
 use alloy_evm::Database;
 use alloy_op_evm::block::receipt_builder::OpReceiptBuilder;
-use alloy_primitives::{BlockHash, Bytes, U256};
+use alloy_primitives::{BlockHash, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::Withdrawals;
 use core::fmt::Debug;
 use op_alloy_consensus::OpDepositReceipt;
@@ -33,7 +33,7 @@ use reth_payload_builder::PayloadId;
 use reth_primitives::SealedHeader;
 use reth_primitives_traits::{InMemorySize, SignedTransaction};
 use reth_revm::{State, context::Block};
-use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction};
+use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, ValidPoolTransaction};
 use revm::{DatabaseCommit, context::result::ResultAndState, interpreter::as_u64_saturated};
 use std::{sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -792,5 +792,93 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
         }
 
         Ok(())
+    }
+
+    /// Ethera: executes pool transactions that became unblocked after an XT instance ran.
+    ///
+    /// The normal pool iterator uses canonical chain nonces, so txs whose nonce only became
+    /// reachable due to an XT executing mid-block appear "queued" (not "pending") and are
+    /// skipped by `best_transactions_with_attributes`. This method fetches and executes them
+    /// directly so they do not stall the nonce chain for the next XT in the same block.
+    ///
+    /// `txs` must already be sorted by nonce and represent a consecutive nonce chain starting
+    /// from the sender's current in-progress EVM nonce.
+    pub(super) fn execute_unblocked_pool_txs<E: Debug + Default, T>(
+        &self,
+        info: &mut ExecutionInfo<E>,
+        db: &mut State<impl Database>,
+        txs: &[Arc<ValidPoolTransaction<T>>],
+        gas_limit: u64,
+    ) -> Result<Vec<TxHash>, PayloadBuilderError>
+    where
+        T: PoolTransaction<Consensus = OpTransactionSigned>,
+    {
+        if txs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut evm = self.evm_config.evm_with_env(&mut *db, self.evm_env.clone());
+        let mut committed = Vec::new();
+
+        for pool_tx in txs {
+            let gas_left = gas_limit.saturating_sub(info.cumulative_gas_used);
+            if pool_tx.transaction.gas_limit() > gas_left {
+                break;
+            }
+
+            let tx = pool_tx.transaction.clone_into_consensus();
+            let tx_hash = *pool_tx.hash();
+            let tx_da_size =
+                op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
+
+            let ResultAndState { result, state } = match evm.transact(&tx) {
+                Ok(res) => res,
+                Err(err) => {
+                    trace!(
+                        target: "payload_builder",
+                        %err,
+                        ?tx_hash,
+                        "Ethera: unblocked pool tx failed, stopping drain"
+                    );
+                    break;
+                }
+            };
+
+            if !result.is_success() {
+                trace!(
+                    target: "payload_builder",
+                    ?tx_hash,
+                    "Ethera: unblocked pool tx reverted, stopping drain"
+                );
+                break;
+            }
+
+            let gas_used = result.gas_used();
+            info.cumulative_gas_used += gas_used;
+            info.cumulative_da_bytes_used += tx_da_size;
+
+            let ctx = ReceiptBuilderCtx {
+                tx: tx.inner(),
+                evm: &evm,
+                result,
+                state: &state,
+                cumulative_gas_used: info.cumulative_gas_used,
+            };
+            info.receipts.push(self.build_receipt(ctx, None));
+            evm.db_mut().commit(state);
+
+            info.executed_senders.push(pool_tx.sender());
+            info.executed_transactions.push(tx.into_inner());
+            committed.push(tx_hash);
+
+            trace!(
+                target: "payload_builder",
+                ?tx_hash,
+                gas_used,
+                "Ethera: executed unblocked pool tx after XT"
+            );
+        }
+
+        Ok(committed)
     }
 }

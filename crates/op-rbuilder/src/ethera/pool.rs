@@ -12,6 +12,8 @@ use thiserror::Error;
 pub struct ExecutableXtInstance {
     pub instance_id: String,
     pub transactions: Vec<Bytes>,
+    /// Unique senders whose nonces are consumed by this instance (in encounter order).
+    pub senders: Vec<Address>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -340,9 +342,18 @@ impl XtPool {
             }
 
             expected = instance_expected;
+
+            let mut senders: Vec<Address> = Vec::new();
+            for entry in &instance_entries {
+                if !senders.contains(&entry.sender) {
+                    senders.push(entry.sender);
+                }
+            }
+
             executable.push(ExecutableXtInstance {
                 instance_id,
                 transactions,
+                senders,
             });
         }
 
