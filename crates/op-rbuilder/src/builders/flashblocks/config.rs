@@ -71,7 +71,7 @@ pub struct FlashblocksConfig {
     /// Maximum number of concurrent WebSocket subscribers
     pub ws_subscriber_limit: Option<u16>,
 
-    /// Compose sidecar configuration for cross-chain transactions
+    /// Ethera sidecar callback configuration
     pub sidecar: SidecarConfig,
 }
 
@@ -139,7 +139,7 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
             ws_subscriber_limit: args.flashblocks.ws_subscriber_limit,
             sidecar: SidecarConfig {
                 endpoint: args.flashblocks.sidecar.endpoint.unwrap_or_default(),
-                poll_timeout: Duration::from_millis(args.flashblocks.sidecar.poll_timeout_ms),
+                request_timeout: Duration::from_millis(args.flashblocks.sidecar.poll_timeout_ms),
                 max_retries: args.flashblocks.sidecar.max_retries,
             },
         })

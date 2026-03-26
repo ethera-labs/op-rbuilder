@@ -4,7 +4,7 @@ use reth_transaction_pool::{PoolTransaction, ValidPoolTransaction};
 use std::{collections::HashSet, sync::Arc};
 use tracing::debug;
 
-use crate::tx::MaybeFlashblockFilter;
+use crate::{ethera::XtPool, tx::MaybeFlashblockFilter};
 
 pub(super) struct BestFlashblocksTxs<T, I>
 where
@@ -13,6 +13,7 @@ where
 {
     inner: reth_payload_util::BestPayloadTransactions<T, I>,
     current_flashblock_number: u64,
+    xt_pool: Arc<XtPool>,
     // Transactions that were already commited to the state. Using them again would cause NonceTooLow
     // so we skip them
     commited_transactions: HashSet<TxHash>,
@@ -23,10 +24,14 @@ where
     T: PoolTransaction,
     I: Iterator<Item = Arc<ValidPoolTransaction<T>>>,
 {
-    pub(super) fn new(inner: reth_payload_util::BestPayloadTransactions<T, I>) -> Self {
+    pub(super) fn new(
+        inner: reth_payload_util::BestPayloadTransactions<T, I>,
+        xt_pool: Arc<XtPool>,
+    ) -> Self {
         Self {
             inner,
             current_flashblock_number: 0,
+            xt_pool,
             commited_transactions: Default::default(),
         }
     }
@@ -60,6 +65,11 @@ where
             let tx = self.inner.next(ctx)?;
             // Skip transaction we already included
             if self.commited_transactions.contains(tx.hash()) {
+                continue;
+            }
+
+            if self.xt_pool.has_blocking_nonce(tx.sender(), tx.nonce()) {
+                self.inner.mark_invalid(tx.sender(), tx.nonce());
                 continue;
             }
 
@@ -104,6 +114,7 @@ where
 mod tests {
     use crate::{
         builders::flashblocks::best_txs::BestFlashblocksTxs,
+        ethera::XtPool,
         mock_tx::{MockFbTransaction, MockFbTransactionFactory},
     };
     use alloy_consensus::Transaction;
@@ -125,7 +136,10 @@ mod tests {
         pool.add_transaction(Arc::new(tx_3), 0);
 
         // Create iterator
-        let mut iterator = BestFlashblocksTxs::new(BestPayloadTransactions::new(pool.best()));
+        let mut iterator = BestFlashblocksTxs::new(
+            BestPayloadTransactions::new(pool.best()),
+            Arc::new(XtPool::default()),
+        );
         // ### First flashblock
         iterator.refresh_iterator(BestPayloadTransactions::new(pool.best()), 0);
         // Accept first tx
@@ -177,7 +191,10 @@ mod tests {
         pool.add_transaction(Arc::new(tx_4), 0);
 
         // Create iterator
-        let mut iterator = BestFlashblocksTxs::new(BestPayloadTransactions::new(pool.best()));
+        let mut iterator = BestFlashblocksTxs::new(
+            BestPayloadTransactions::new(pool.best()),
+            Arc::new(XtPool::default()),
+        );
         // ### First flashblock
         // should contain txs 1 and 2
         iterator.refresh_iterator(BestPayloadTransactions::new(pool.best()), 0);

@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use tracing::warn;
 
 /// Build JSON-RPC state overrides for the current in-progress builder state.
-pub fn build_state_overrides<DB: Database>(state: &State<DB>) -> Value {
+fn build_state_overrides<DB: Database>(state: &State<DB>) -> Value {
     let mut overrides = Map::new();
 
     match state.transition_state.as_ref() {

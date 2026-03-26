@@ -2,7 +2,7 @@ use alloy_consensus::{Eip658Value, Transaction, conditional::BlockConditionalAtt
 use alloy_eips::{Decodable2718, Encodable2718, Typed2718};
 use alloy_evm::Database;
 use alloy_op_evm::block::receipt_builder::OpReceiptBuilder;
-use alloy_primitives::{BlockHash, Bytes, U256};
+use alloy_primitives::{BlockHash, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::Withdrawals;
 use core::fmt::Debug;
 use op_alloy_consensus::OpDepositReceipt;
@@ -33,17 +33,17 @@ use reth_payload_builder::PayloadId;
 use reth_primitives::SealedHeader;
 use reth_primitives_traits::{InMemorySize, SignedTransaction};
 use reth_revm::{State, context::Block};
-use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction};
+use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, ValidPoolTransaction};
 use revm::{DatabaseCommit, context::result::ResultAndState, interpreter::as_u64_saturated};
 use std::{sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
 use crate::{
+    ethera::{ExecutableXtInstance, XtExecutionError},
     gas_limiter::AddressGasLimiter,
     metrics::OpRBuilderMetrics,
     primitives::reth::{ExecutionInfo, TxnExecutionResult},
-    sidecar::{ExternalTransaction, SidecarError},
     traits::PayloadTxsBounds,
     tx::MaybeRevertingTransaction,
     tx_signer::Signer,
@@ -625,191 +625,143 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
         Ok(None)
     }
 
-    /// Executes external transactions from the compose sidecar.
-    ///
-    /// External transactions are cross-chain transactions coordinated by the sidecar.
-    /// Required transactions must succeed or the flashblock build fails.
-    /// Optional transactions are best-effort and skipped on failure.
-    pub(super) fn execute_sidecar_transactions<E: Debug + Default>(
+    fn decode_xt_transaction(
         &self,
-        info: &mut ExecutionInfo<E>,
-        db: &mut State<impl Database>,
-        external_txs: Vec<ExternalTransaction>,
+        instance_id: &str,
+        raw: &Bytes,
+    ) -> Result<reth_primitives_traits::Recovered<OpTransactionSigned>, PayloadBuilderError> {
+        let tx = OpTransactionSigned::decode_2718(&mut raw.as_ref()).map_err(|err| {
+            error!(
+                target: "payload_builder",
+                %err,
+                raw_len = raw.len(),
+                instance_id,
+                "Ethera XT transaction decode failed"
+            );
+            PayloadBuilderError::other(XtExecutionError::Decode(err.to_string()))
+        })?;
+
+        let tx_hash = tx.tx_hash();
+        let tx = tx.try_clone_into_recovered().map_err(|_| {
+            error!(
+                target: "payload_builder",
+                ?tx_hash,
+                instance_id,
+                "Ethera XT transaction signature recovery failed"
+            );
+            PayloadBuilderError::other(XtExecutionError::SignatureRecovery)
+        })?;
+
+        if tx.is_eip4844() || tx.is_deposit() {
+            error!(
+                target: "payload_builder",
+                ?tx_hash,
+                is_blob = tx.is_eip4844(),
+                is_deposit = tx.is_deposit(),
+                instance_id,
+                "Ethera XT transaction has invalid type"
+            );
+            return Err(PayloadBuilderError::other(
+                XtExecutionError::InvalidTransactionType,
+            ));
+        }
+
+        Ok(tx)
+    }
+
+    pub(super) fn xt_instance_fits<E: Debug + Default>(
+        &self,
+        info: &ExecutionInfo<E>,
+        xt_instance: &ExecutableXtInstance,
         block_gas_limit: u64,
         block_da_limit: Option<u64>,
         block_da_footprint_limit: Option<u64>,
+    ) -> Result<bool, PayloadBuilderError> {
+        let tx_da_limit = self.da_config.max_da_tx_size();
+        let mut projected = ExecutionInfo::<()>::default();
+        projected.cumulative_gas_used = info.cumulative_gas_used;
+        projected.cumulative_da_bytes_used = info.cumulative_da_bytes_used;
+        projected.da_footprint_scalar = info.da_footprint_scalar;
+
+        for raw in &xt_instance.transactions {
+            let tx = self.decode_xt_transaction(&xt_instance.instance_id, raw)?;
+            let tx_da_size =
+                op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
+            if projected
+                .is_tx_over_limits(
+                    tx_da_size,
+                    block_gas_limit,
+                    tx_da_limit,
+                    block_da_limit,
+                    tx.gas_limit(),
+                    info.da_footprint_scalar,
+                    block_da_footprint_limit,
+                )
+                .is_err()
+            {
+                return Ok(false);
+            }
+            projected.cumulative_gas_used =
+                projected.cumulative_gas_used.saturating_add(tx.gas_limit());
+            projected.cumulative_da_bytes_used =
+                projected.cumulative_da_bytes_used.saturating_add(tx_da_size);
+        }
+
+        Ok(true)
+    }
+
+    /// Executes released Ethera XT transactions.
+    pub(super) fn execute_xt_transactions<E: Debug + Default>(
+        &self,
+        info: &mut ExecutionInfo<E>,
+        db: &mut State<impl Database>,
+        xt_instance: &ExecutableXtInstance,
     ) -> Result<(), PayloadBuilderError> {
-        if external_txs.is_empty() {
+        if xt_instance.transactions.is_empty() {
             return Ok(());
         }
 
-        let tx_da_limit = self.da_config.max_da_tx_size();
         let mut evm = self.evm_config.evm_with_env(&mut *db, self.evm_env.clone());
 
         debug!(
             target: "payload_builder",
-            count = external_txs.len(),
-            required_count = external_txs.iter().filter(|t| t.required).count(),
-            "Executing sidecar transactions",
+            count = xt_instance.transactions.len(),
+            instance_id = %xt_instance.instance_id,
+            "Executing Ethera XT transactions",
         );
 
-        for ext_tx in external_txs {
-            let tx = match OpTransactionSigned::decode_2718(&mut ext_tx.raw.as_ref()) {
-                Ok(tx) => tx,
-                Err(err) => {
-                    if ext_tx.required {
-                        error!(
-                            target: "payload_builder",
-                            %err,
-                            raw_len = ext_tx.raw.len(),
-                            instance_id = ?ext_tx.instance_id,
-                            "required sidecar transaction decode failed"
-                        );
-                        return Err(PayloadBuilderError::other(SidecarError::DecodeError(
-                            err.to_string(),
-                        )));
-                    }
-                    trace!(
-                        target: "payload_builder",
-                        %err,
-                        "skipping malformed optional sidecar transaction"
-                    );
-                    continue;
-                }
-            };
-
+        for raw in &xt_instance.transactions {
+            let tx = self.decode_xt_transaction(&xt_instance.instance_id, raw)?;
             let tx_hash = tx.tx_hash();
+            let tx_da_size = op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
 
-            let tx = match tx.try_clone_into_recovered() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    if ext_tx.required {
-                        error!(
-                            target: "payload_builder",
-                            ?tx_hash,
-                            instance_id = ?ext_tx.instance_id,
-                            "required sidecar transaction signature recovery failed"
-                        );
-                        return Err(PayloadBuilderError::other(
-                            SidecarError::SignatureRecoveryFailed,
-                        ));
-                    }
-                    trace!(
-                        target: "payload_builder",
-                        ?tx_hash,
-                        "skipping sidecar transaction with invalid signature"
-                    );
-                    continue;
-                }
-            };
-
-            // Sidecar transactions must not be deposit or blob transactions
-            if tx.is_eip4844() || tx.is_deposit() {
-                if ext_tx.required {
-                    error!(
-                        target: "payload_builder",
-                        ?tx_hash,
-                        is_blob = tx.is_eip4844(),
-                        is_deposit = tx.is_deposit(),
-                        instance_id = ?ext_tx.instance_id,
-                        "required sidecar transaction has invalid type"
-                    );
-                    return Err(PayloadBuilderError::other(
-                        SidecarError::InvalidTransactionType,
-                    ));
-                }
-                trace!(
-                    target: "payload_builder",
-                    ?tx_hash,
-                    "skipping sidecar blob/deposit transaction"
-                );
-                continue;
-            }
-
-            // Calculate DA size for limit checks
-            let tx_da_size =
-                op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
-
-            // Validate block limits
-            if let Err(result) = info.is_tx_over_limits(
-                tx_da_size,
-                block_gas_limit,
-                tx_da_limit,
-                block_da_limit,
-                tx.gas_limit(),
-                info.da_footprint_scalar,
-                block_da_footprint_limit,
-            ) {
-                if ext_tx.required {
-                    error!(
-                        target: "payload_builder",
-                        ?tx_hash,
-                        %result,
-                        gas_limit = tx.gas_limit(),
-                        tx_da_size,
-                        instance_id = ?ext_tx.instance_id,
-                        "required sidecar transaction exceeds block limits"
-                    );
-                    return Err(PayloadBuilderError::other(SidecarError::LimitsExceeded(
-                        result.to_string(),
-                    )));
-                }
-                debug!(
-                    target: "payload_builder",
-                    ?tx_hash,
-                    %result,
-                    "skipping optional sidecar transaction over limits"
-                );
-                continue;
-            }
-
-            // Execute the transaction
             let ResultAndState { result, state } = match evm.transact(&tx) {
                 Ok(res) => res,
                 Err(err) => {
-                    if ext_tx.required {
-                        error!(
-                            target: "payload_builder",
-                            %err,
-                            ?tx_hash,
-                            instance_id = ?ext_tx.instance_id,
-                            "required sidecar transaction execution failed"
-                        );
-                        return Err(PayloadBuilderError::other(SidecarError::ExecutionFailed(
-                            err.to_string(),
-                        )));
-                    }
-                    trace!(
+                    error!(
                         target: "payload_builder",
                         %err,
                         ?tx_hash,
-                        "skipping failed optional sidecar transaction"
+                        instance_id = %xt_instance.instance_id,
+                        "Ethera XT transaction execution failed"
                     );
-                    continue;
+                    return Err(PayloadBuilderError::other(
+                        XtExecutionError::ExecutionFailed(err.to_string()),
+                    ));
                 }
             };
 
-            // Handle reverted transactions
             if !result.is_success() {
-                if ext_tx.required {
-                    error!(
-                        target: "payload_builder",
-                        ?tx_hash,
-                        ?result,
-                        instance_id = ?ext_tx.instance_id,
-                        "required sidecar transaction reverted during execution"
-                    );
-                    return Err(PayloadBuilderError::other(
-                        SidecarError::TransactionReverted(tx_hash.to_string()),
-                    ));
-                }
-                // Optional transactions that revert are skipped
-                debug!(
+                error!(
                     target: "payload_builder",
                     ?tx_hash,
-                    "skipping reverted optional sidecar transaction"
+                    ?result,
+                    instance_id = %xt_instance.instance_id,
+                    "Ethera XT transaction reverted during execution"
                 );
-                continue;
+                return Err(PayloadBuilderError::other(XtExecutionError::Reverted(
+                    tx_hash.to_string(),
+                )));
             }
 
             let gas_used = result.gas_used();
@@ -833,13 +785,100 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
             debug!(
                 target: "payload_builder",
                 ?tx_hash,
-                required = ext_tx.required,
-                instance_id = ?ext_tx.instance_id,
+                instance_id = %xt_instance.instance_id,
                 gas_used,
-                "executed sidecar transaction"
+                "Executed Ethera XT transaction"
             );
         }
 
         Ok(())
+    }
+
+    /// Ethera: executes pool transactions that became unblocked after an XT instance ran.
+    ///
+    /// The normal pool iterator uses canonical chain nonces, so txs whose nonce only became
+    /// reachable due to an XT executing mid-block appear "queued" (not "pending") and are
+    /// skipped by `best_transactions_with_attributes`. This method fetches and executes them
+    /// directly so they do not stall the nonce chain for the next XT in the same block.
+    ///
+    /// `txs` must already be sorted by nonce and represent a consecutive nonce chain starting
+    /// from the sender's current in-progress EVM nonce.
+    pub(super) fn execute_unblocked_pool_txs<E: Debug + Default, T>(
+        &self,
+        info: &mut ExecutionInfo<E>,
+        db: &mut State<impl Database>,
+        txs: &[Arc<ValidPoolTransaction<T>>],
+        gas_limit: u64,
+    ) -> Result<Vec<TxHash>, PayloadBuilderError>
+    where
+        T: PoolTransaction<Consensus = OpTransactionSigned>,
+    {
+        if txs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut evm = self.evm_config.evm_with_env(&mut *db, self.evm_env.clone());
+        let mut committed = Vec::new();
+
+        for pool_tx in txs {
+            let gas_left = gas_limit.saturating_sub(info.cumulative_gas_used);
+            if pool_tx.transaction.gas_limit() > gas_left {
+                break;
+            }
+
+            let tx = pool_tx.transaction.clone_into_consensus();
+            let tx_hash = *pool_tx.hash();
+            let tx_da_size =
+                op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
+
+            let ResultAndState { result, state } = match evm.transact(&tx) {
+                Ok(res) => res,
+                Err(err) => {
+                    trace!(
+                        target: "payload_builder",
+                        %err,
+                        ?tx_hash,
+                        "Ethera: unblocked pool tx failed, stopping drain"
+                    );
+                    break;
+                }
+            };
+
+            if !result.is_success() {
+                trace!(
+                    target: "payload_builder",
+                    ?tx_hash,
+                    "Ethera: unblocked pool tx reverted, stopping drain"
+                );
+                break;
+            }
+
+            let gas_used = result.gas_used();
+            info.cumulative_gas_used += gas_used;
+            info.cumulative_da_bytes_used += tx_da_size;
+
+            let ctx = ReceiptBuilderCtx {
+                tx: tx.inner(),
+                evm: &evm,
+                result,
+                state: &state,
+                cumulative_gas_used: info.cumulative_gas_used,
+            };
+            info.receipts.push(self.build_receipt(ctx, None));
+            evm.db_mut().commit(state);
+
+            info.executed_senders.push(pool_tx.sender());
+            info.executed_transactions.push(tx.into_inner());
+            committed.push(tx_hash);
+
+            trace!(
+                target: "payload_builder",
+                ?tx_hash,
+                gas_used,
+                "Ethera: executed unblocked pool tx after XT"
+            );
+        }
+
+        Ok(committed)
     }
 }

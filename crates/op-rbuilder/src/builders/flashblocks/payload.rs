@@ -35,6 +35,7 @@ use reth_optimism_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
 use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
+use reth_optimism_payload_builder::error::OpPayloadBuilderError;
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_primitives_traits::RecoveredBlock;
@@ -49,7 +50,7 @@ use reth_transaction_pool::TransactionPool;
 use reth_trie::{HashedPostState, updates::TrieUpdates};
 use revm::Database;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ops::{Div, Rem},
     sync::Arc,
     time::Instant,
@@ -192,7 +193,7 @@ pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
     pub address_gas_limiter: AddressGasLimiter,
     /// Tokio task metrics for monitoring spawned tasks
     pub task_metrics: Arc<FlashblocksTaskMetrics>,
-    /// Sidecar client for cross-chain transactions
+    /// Sidecar client for XT inclusion confirmation callbacks.
     pub sidecar: crate::sidecar::SidecarClient,
 }
 
@@ -527,10 +528,13 @@ where
             .map_err(|e| PayloadBuilderError::Other(e.into()))?;
 
         // Create best_transaction iterator
-        let mut best_txs = BestFlashblocksTxs::new(BestPayloadTransactions::new(
-            self.pool
-                .best_transactions_with_attributes(ctx.best_transaction_attributes()),
-        ));
+        let mut best_txs = BestFlashblocksTxs::new(
+            BestPayloadTransactions::new(
+                self.pool
+                    .best_transactions_with_attributes(ctx.best_transaction_attributes()),
+            ),
+            self.config.xt_pool.clone(),
+        );
         let interval = self.config.specific.interval;
         let (tx, rx) =
             std::sync::mpsc::sync_channel((self.config.flashblocks_per_block() + 1) as usize);
@@ -676,8 +680,9 @@ where
             };
 
             ctx = ctx.with_extra_ctx(next_flashblocks_ctx);
-            // Confirm after the flashblock is fully built and published.
-            self.sidecar.confirm_executed(confirmed_ids);
+            if !confirmed_ids.is_empty() {
+                self.sidecar.confirm_included(confirmed_ids);
+            }
         }
     }
 
@@ -750,47 +755,148 @@ where
             *footprint = footprint.saturating_sub(builder_tx_da_size.saturating_mul(scalar as u64));
         }
 
-        // Execute pool transactions first. The sidecar poll is deferred until after the pool so
-        // state_overrides sent to sidecar reflect this flashblock's pool-tx effects.
-        let best_txs_start_time = Instant::now();
-        best_txs.refresh_iterator(
-            BestPayloadTransactions::new(
-                self.pool
-                    .best_transactions_with_attributes(ctx.best_transaction_attributes()),
-            ),
-            flashblock_index,
-        );
-        let transaction_pool_fetch_time = best_txs_start_time.elapsed();
-        ctx.metrics
-            .transaction_pool_fetch_duration
-            .record(transaction_pool_fetch_time);
-        ctx.metrics
-            .transaction_pool_fetch_gauge
-            .set(transaction_pool_fetch_time);
-
         let tx_execution_start_time = Instant::now();
-        let gas_before_sidecar = info.cumulative_gas_used;
-        ctx.execute_best_transactions(
-            info,
-            state,
-            best_txs,
-            target_gas_for_batch.min(ctx.block_gas_limit()),
-            target_da_for_batch,
-            target_da_footprint_for_batch,
-        )
-        .wrap_err("failed to execute best transactions")?;
-        // Extract last transactions
-        let new_transactions = info.executed_transactions[info.extra.last_flashblock_index..]
-            .to_vec()
-            .iter()
-            .map(|tx| tx.tx_hash())
-            .collect::<Vec<_>>();
-        best_txs.mark_commited(new_transactions);
+        let mut instance_ids_to_confirm: Vec<String> = Vec::new();
 
-        // We got block cancelled, we won't need anything from the block at this point
-        // Caution: this assume that block cancel token only cancelled when new FCU is received
-        if block_cancel.is_cancelled() {
-            return Ok(None);
+        loop {
+            let mut made_progress = false;
+            let executed_before = info.executed_transactions.len();
+
+            // Execute pool transactions first so released XT reservations observe the
+            // current flashblock state.
+            let best_txs_start_time = Instant::now();
+            best_txs.refresh_iterator(
+                BestPayloadTransactions::new(
+                    self.pool
+                        .best_transactions_with_attributes(ctx.best_transaction_attributes()),
+                ),
+                flashblock_index,
+            );
+            let transaction_pool_fetch_time = best_txs_start_time.elapsed();
+            ctx.metrics
+                .transaction_pool_fetch_duration
+                .record(transaction_pool_fetch_time);
+            ctx.metrics
+                .transaction_pool_fetch_gauge
+                .set(transaction_pool_fetch_time);
+
+            ctx.execute_best_transactions(
+                info,
+                state,
+                best_txs,
+                target_gas_for_batch.min(ctx.block_gas_limit()),
+                target_da_for_batch,
+                target_da_footprint_for_batch,
+            )
+            .wrap_err("failed to execute best transactions")?;
+
+            let new_transactions = info.executed_transactions[executed_before..]
+                .iter()
+                .map(|tx| tx.tx_hash())
+                .collect::<Vec<_>>();
+            if !new_transactions.is_empty() {
+                best_txs.mark_commited(new_transactions);
+                made_progress = true;
+            }
+
+            // We got block cancelled, we won't need anything from the block at this point
+            // Caution: this assume that block cancel token only cancelled when new FCU is received
+            if block_cancel.is_cancelled() {
+                return Ok(None);
+            }
+
+            let active_senders = self.config.xt_pool.active_senders();
+            if !active_senders.is_empty() {
+                let mut current_nonces = HashMap::with_capacity(active_senders.len());
+                for sender in active_senders {
+                    let nonce = state
+                        .load_cache_account(sender)
+                        .map(|account| account.account_info().unwrap_or_default().nonce)
+                        .map_err(|_| {
+                            PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(sender))
+                        })?;
+                    current_nonces.insert(sender, nonce);
+                }
+
+                if let Some(xt_instance) = self
+                    .config
+                    .xt_pool
+                    .collect_executable_instances(&current_nonces)
+                    .into_iter()
+                    .next()
+                {
+                    if ctx.xt_instance_fits(
+                        info,
+                        &xt_instance,
+                        target_gas_for_batch.min(ctx.block_gas_limit()),
+                        target_da_for_batch,
+                        target_da_footprint_for_batch,
+                    )? {
+                        if let Err(err) = ctx.execute_xt_transactions(info, state, &xt_instance) {
+                            self.config.xt_pool.abort(&xt_instance.instance_id);
+                            return Err(err).wrap_err_with(|| {
+                                format!(
+                                    "failed to execute Ethera XT instance {}",
+                                    xt_instance.instance_id
+                                )
+                            });
+                        }
+                        self.config
+                            .xt_pool
+                            .mark_included(std::slice::from_ref(&xt_instance.instance_id));
+                        instance_ids_to_confirm.push(xt_instance.instance_id.clone());
+                        made_progress = true;
+
+                        // Ethera: drain pool txs from XT senders that are now unblocked.
+                        // The pool uses canonical chain nonces so txs whose nonce just became
+                        // reachable due to this XT executing mid-block appear "queued" (not
+                        // "pending") and won't be returned by best_transactions_with_attributes.
+                        // Executing them here keeps the nonce chain live so the next XT in this
+                        // sender's sequence can execute within the same flashblock.
+                        let gas_limit =
+                            target_gas_for_batch.min(ctx.block_gas_limit());
+                        for &sender in &xt_instance.senders {
+                            let evm_nonce = state
+                                .load_cache_account(sender)
+                                .map(|acct| acct.account_info().unwrap_or_default().nonce)
+                                .map_err(|_| {
+                                    PayloadBuilderError::other(
+                                        OpPayloadBuilderError::AccountLoadFailed(sender),
+                                    )
+                                })?;
+
+                            let mut queued =
+                                self.pool.get_queued_transactions_by_sender(sender);
+                            queued.sort_by_key(|tx| tx.nonce());
+                            let consecutive: Vec<_> = queued
+                                .into_iter()
+                                .scan(evm_nonce, |expected, tx| {
+                                    if tx.nonce() == *expected {
+                                        *expected += 1;
+                                        Some(tx)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            let committed = ctx.execute_unblocked_pool_txs(
+                                info,
+                                state,
+                                &consecutive,
+                                gas_limit,
+                            )?;
+                            if !committed.is_empty() {
+                                best_txs.mark_commited(committed);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !made_progress {
+                break;
+            }
         }
 
         let payload_transaction_simulation_time = tx_execution_start_time.elapsed();
@@ -800,83 +906,6 @@ where
         ctx.metrics
             .payload_transaction_simulation_gauge
             .set(payload_transaction_simulation_time);
-
-        // Poll sidecar for cross-chain transactions.
-        let pool_gas_used = info.cumulative_gas_used.saturating_sub(gas_before_sidecar);
-        let state_overrides = if self.sidecar.is_enabled() {
-            let overrides = crate::sidecar::build_state_overrides(state);
-            match overrides.as_object() {
-                Some(map) if map.is_empty() => None,
-                Some(_) => Some(overrides),
-                None => None,
-            }
-        } else {
-            None
-        };
-        let poll_request = crate::sidecar::PollRequest {
-            chain_id: ctx.chain_id(),
-            block_number: ctx.block_number(),
-            flashblock_index,
-            state_root: ctx.parent().header().state_root,
-            timestamp: ctx.timestamp(),
-            gas_limit: target_gas_for_batch.saturating_sub(pool_gas_used),
-            state_overrides,
-            confirmed_instance_ids: Vec::new(), // populated by SidecarClient::poll_transactions
-        };
-        let sidecar_poll = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.sidecar.poll_transactions(&poll_request))
-        });
-        // Collect IDs of successfully executed sidecar XTs. Confirmation is
-        // deferred until after the flashblock is fully built and published so
-        // we don't confirm XTs that were never actually included on-chain.
-        let mut instance_ids_to_confirm: Vec<String> = Vec::new();
-
-        match sidecar_poll {
-            Ok(Some(external_txs)) if !external_txs.is_empty() => {
-                let sidecar_tx_count = external_txs.len();
-                let sidecar_required_count = external_txs.iter().filter(|tx| tx.required).count();
-                let instance_ids: Vec<String> = external_txs
-                    .iter()
-                    .filter_map(|tx| tx.instance_id.clone())
-                    .collect();
-
-                if let Err(err) = ctx.execute_sidecar_transactions(
-                    info,
-                    state,
-                    external_txs,
-                    target_gas_for_batch.min(ctx.block_gas_limit()),
-                    target_da_for_batch,
-                    target_da_footprint_for_batch,
-                ) {
-                    error!(
-                        target: "payload_builder",
-                        chain_id = ctx.chain_id(),
-                        block_number = ctx.block_number(),
-                        flashblock_index,
-                        sidecar_tx_count,
-                        sidecar_required_count,
-                        err = %err,
-                        err_debug = ?err,
-                        "failed while executing sidecar transactions"
-                    );
-                    return Err(err).wrap_err("failed to execute sidecar transactions");
-                }
-
-                instance_ids_to_confirm = instance_ids;
-            }
-            Ok(_) => {}
-            Err(err) => {
-                warn!(
-                    target: "payload_builder",
-                    chain_id = ctx.chain_id(),
-                    block_number = ctx.block_number(),
-                    flashblock_index,
-                    err = %err,
-                    "sidecar poll failed, continuing without external transactions"
-                );
-            }
-        }
 
         if let Err(e) = self
             .builder_tx
