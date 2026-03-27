@@ -2,8 +2,6 @@
 
 mod client;
 mod config;
-#[cfg(test)]
-mod overrides;
 mod types;
 
 pub use client::SidecarClient;

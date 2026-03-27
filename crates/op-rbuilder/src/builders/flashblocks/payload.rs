@@ -833,13 +833,14 @@ where
                         target_da_footprint_for_batch,
                     )? {
                         if let Err(err) = ctx.execute_xt_transactions(info, state, &xt_instance) {
+                            warn!(
+                                target: "payload_builder",
+                                instance_id = %xt_instance.instance_id,
+                                %err,
+                                "XT execution failed, aborting instance and continuing"
+                            );
                             self.config.xt_pool.abort(&xt_instance.instance_id);
-                            return Err(err).wrap_err_with(|| {
-                                format!(
-                                    "failed to execute Ethera XT instance {}",
-                                    xt_instance.instance_id
-                                )
-                            });
+                            continue;
                         }
                         self.config
                             .xt_pool
@@ -847,12 +848,9 @@ where
                         instance_ids_to_confirm.push(xt_instance.instance_id.clone());
                         made_progress = true;
 
-                        // Ethera: drain pool txs from XT senders that are now unblocked.
-                        // The pool uses canonical chain nonces so txs whose nonce just became
-                        // reachable due to this XT executing mid-block appear "queued" (not
-                        // "pending") and won't be returned by best_transactions_with_attributes.
-                        // Executing them here keeps the nonce chain live so the next XT in this
-                        // sender's sequence can execute within the same flashblock.
+                        // Pool uses canonical chain nonces, so txs unblocked by this XT
+                        // mid-block appear "queued" and won't surface via best_transactions.
+                        // Execute them now to keep the nonce chain live for subsequent XTs.
                         let gas_limit =
                             target_gas_for_batch.min(ctx.block_gas_limit());
                         for &sender in &xt_instance.senders {

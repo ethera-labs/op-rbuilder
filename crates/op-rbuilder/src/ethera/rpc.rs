@@ -105,8 +105,9 @@ where
             .await
             .map_err(Into::into)?
             .to::<u64>();
-        self.xt_pool.prune_confirmed_sender(address, on_chain);
 
+        // Alternate between pool and XtPool until neither advances the cursor,
+        // handling interleaved reservations (e.g. pool:[0,1], XT:[2,3], pool:[4]).
         let mut next_nonce = on_chain;
         loop {
             let mut advanced = false;
