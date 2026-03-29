@@ -309,40 +309,6 @@ impl XtPool {
         state.rebuild_senders(touched_senders);
     }
 
-    pub fn prune_confirmed_sender(&self, sender: Address, on_chain_nonce: u64) {
-        let mut state = self.inner.write();
-        let instance_ids = state.by_instance.keys().cloned().collect::<Vec<_>>();
-        for instance_id in instance_ids {
-            let mut remove_instance = false;
-            let mut order = None;
-
-            if let Some(instance) = state.by_instance.get_mut(&instance_id) {
-                let len_before = instance.entries.len();
-                instance
-                    .entries
-                    .retain(|entry| !(entry.sender == sender && entry.nonce < on_chain_nonce));
-                if instance.entries.len() == len_before {
-                    continue;
-                }
-
-                if instance.entries.is_empty() {
-                    remove_instance = true;
-                    order = Some(instance.order);
-                } else {
-                    instance.senders = unique_senders(&instance.entries);
-                }
-            }
-
-            if remove_instance {
-                let _ = state.by_instance.remove(&instance_id);
-                if let Some(order) = order {
-                    state.ordered_instances.remove(&(order, instance_id));
-                }
-            }
-        }
-        state.rebuild_sender(sender);
-    }
-
     pub fn active_senders(&self) -> Vec<Address> {
         let mut senders = self
             .inner
