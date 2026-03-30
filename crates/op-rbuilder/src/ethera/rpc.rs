@@ -146,7 +146,10 @@ where
             .try_clone_into_recovered()
             .map_err(|_| EthApiError::InvalidParams("signature recovery failed".into()))?;
 
-        if self.xt_pool.has_reserved_nonce(recovered.signer(), recovered.nonce()) {
+        if self
+            .xt_pool
+            .has_reserved_nonce(recovered.signer(), recovered.nonce())
+        {
             return Err(EthApiError::InvalidParams(
                 "nonce reserved by Ethera XT transaction".into(),
             )
