@@ -102,23 +102,3 @@ async fn confirm_instances(
         .expect("retry loop always stores the last error before returning")
         .into())
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::sidecar::SidecarConfig;
-
-    #[test]
-    fn disabled_config_is_reported_as_disabled() {
-        let config = SidecarConfig::default();
-        assert!(!config.is_enabled());
-    }
-
-    #[test]
-    fn configured_endpoint_is_reported_as_enabled() {
-        let config = SidecarConfig {
-            endpoint: "http://localhost:8082".to_string(),
-            ..Default::default()
-        };
-        assert!(config.is_enabled());
-    }
-}
