@@ -685,9 +685,10 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
 
         for raw in &xt_instance.transactions {
             let tx = self.decode_xt_transaction(&xt_instance.instance_id, raw)?;
+            let tx_hash = tx.tx_hash();
             let tx_da_size =
                 op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
-            if projected
+            if let Err(err) = projected
                 .is_tx_over_limits(
                     tx_da_size,
                     block_gas_limit,
@@ -697,8 +698,25 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
                     info.da_footprint_scalar,
                     block_da_footprint_limit,
                 )
-                .is_err()
             {
+                info!(
+                    target: "payload_builder",
+                    instance_id = %xt_instance.instance_id,
+                    ?tx_hash,
+                    sender = ?tx.signer(),
+                    nonce = tx.nonce(),
+                    tx_gas_limit = tx.gas_limit(),
+                    tx_da_size,
+                    cumulative_gas_used = info.cumulative_gas_used,
+                    cumulative_da_bytes_used = info.cumulative_da_bytes_used,
+                    projected_gas_used = projected.cumulative_gas_used.saturating_add(tx.gas_limit()),
+                    projected_da_bytes_used = projected.cumulative_da_bytes_used.saturating_add(tx_da_size),
+                    block_gas_limit,
+                    block_da_limit = ?block_da_limit,
+                    block_da_footprint_limit = ?block_da_footprint_limit,
+                    %err,
+                    "Ethera XT instance does not fit current flashblock limits"
+                );
                 return Ok(false);
             }
             projected.cumulative_gas_used =

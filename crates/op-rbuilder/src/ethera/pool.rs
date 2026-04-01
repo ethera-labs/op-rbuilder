@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use reth_primitives_traits::SignedTransaction;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct ExecutableXtInstance {
@@ -16,10 +17,32 @@ pub struct ExecutableXtInstance {
     pub senders: Vec<Address>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct XtBlockedReason {
+    pub instance_id: String,
+    pub sender: Address,
+    pub phase: &'static str,
+    pub status: &'static str,
+    pub tx_index: usize,
+    pub entry_nonce: u64,
+    pub current_nonce: Option<u64>,
+    pub tx_hash: TxHash,
+    pub reason: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum XtReservationPhase {
     PutInbox,
     Xt,
+}
+
+impl XtReservationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PutInbox => "put_inbox",
+            Self::Xt => "xt",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +50,16 @@ enum XtEntryStatus {
     Locked,
     Released,
     Included,
+}
+
+impl XtEntryStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Released => "released",
+            Self::Included => "included",
+        }
+    }
 }
 
 impl XtEntryStatus {
@@ -274,7 +307,30 @@ impl XtPool {
             }
         }
         entries.senders = unique_senders(&entries.entries);
+        let released_xt_count = entries
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.phase == XtReservationPhase::Xt && entry.status == XtEntryStatus::Released
+            })
+            .count();
+        let released_put_inbox_count = entries
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.phase == XtReservationPhase::PutInbox
+                    && entry.status == XtEntryStatus::Released
+            })
+            .count();
         let senders = entries.senders.clone();
+        info!(
+            target: "ethera_xt",
+            instance_id = %request.instance_id,
+            senders = entries.senders.len(),
+            released_xt_count,
+            released_put_inbox_count,
+            "Released XT reservations into executable state"
+        );
         state.rebuild_senders(senders);
         Ok(())
     }
@@ -410,6 +466,77 @@ impl XtPool {
         }
 
         executable
+    }
+
+    pub(crate) fn first_blocked_instance_reason(
+        &self,
+        current_nonces: &HashMap<Address, u64>,
+    ) -> Option<XtBlockedReason> {
+        let state = self.inner.read();
+        let mut expected = current_nonces.clone();
+
+        for (_, instance_id) in &state.ordered_instances {
+            let instance = state.by_instance.get(instance_id)?;
+            let mut instance_expected = expected.clone();
+            let mut transactions = 0usize;
+
+            for entry in &instance.entries {
+                let Some(current_nonce) = instance_expected.get_mut(&entry.sender) else {
+                    return Some(XtBlockedReason {
+                        instance_id: instance_id.clone(),
+                        sender: entry.sender,
+                        phase: entry.phase.as_str(),
+                        status: entry.status.as_str(),
+                        tx_index: entry.tx_index,
+                        entry_nonce: entry.nonce,
+                        current_nonce: None,
+                        tx_hash: entry.tx_hash,
+                        reason: "sender nonce unavailable in current state",
+                    });
+                };
+
+                if entry.nonce < *current_nonce {
+                    continue;
+                }
+
+                if entry.status != XtEntryStatus::Released {
+                    return Some(XtBlockedReason {
+                        instance_id: instance_id.clone(),
+                        sender: entry.sender,
+                        phase: entry.phase.as_str(),
+                        status: entry.status.as_str(),
+                        tx_index: entry.tx_index,
+                        entry_nonce: entry.nonce,
+                        current_nonce: Some(*current_nonce),
+                        tx_hash: entry.tx_hash,
+                        reason: "reservation is not released",
+                    });
+                }
+
+                if entry.nonce != *current_nonce {
+                    return Some(XtBlockedReason {
+                        instance_id: instance_id.clone(),
+                        sender: entry.sender,
+                        phase: entry.phase.as_str(),
+                        status: entry.status.as_str(),
+                        tx_index: entry.tx_index,
+                        entry_nonce: entry.nonce,
+                        current_nonce: Some(*current_nonce),
+                        tx_hash: entry.tx_hash,
+                        reason: "nonce does not match current execution cursor",
+                    });
+                }
+
+                transactions += 1;
+                *current_nonce = current_nonce.saturating_add(1);
+            }
+
+            if transactions > 0 {
+                expected = instance_expected;
+            }
+        }
+
+        None
     }
 }
 
