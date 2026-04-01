@@ -58,6 +58,9 @@ pub(super) trait PayloadBuilder: Send + Sync + Clone {
         args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
         best_payload: BlockCell<Self::BuiltPayload>,
     ) -> Result<(), PayloadBuilderError>;
+
+    /// Notifies the builder that a payload block hash became canonical.
+    fn on_new_canonical_block(&self, _block_hash: B256) {}
 }
 
 /// The generator type that creates new jobs that builds empty blocks.
@@ -230,6 +233,7 @@ where
             block: committed.tip().hash(),
             cached,
         });
+        self.builder.on_new_canonical_block(committed.tip().hash());
     }
 }
 
@@ -466,17 +470,21 @@ fn job_deadline(unix_timestamp_secs: u64) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{BlockBody, Header};
     use alloy_eips::eip7685::Requests;
-    use alloy_primitives::U256;
+    use alloy_primitives::{Address, U256};
     use rand::rng;
     use reth::tasks::TokioTaskExecutor;
+    use reth_execution_types::Chain;
     use reth_node_api::NodePrimitives;
     use reth_optimism_payload_builder::{OpPayloadPrimitives, payload::OpPayloadBuilderAttributes};
     use reth_optimism_primitives::OpPrimitives;
     use reth_payload_primitives::BuiltPayloadExecutedBlock;
     use reth_primitives::SealedBlock;
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_primitives_traits::{Block, RecoveredBlock};
+    use reth_provider::{CanonStateNotification, test_utils::MockEthProvider};
     use reth_testing_utils::generators::{BlockRangeParams, random_block_range};
+    use reth_trie::LazyTrieData;
     use tokio::{
         task,
         time::{Duration, sleep},
@@ -604,6 +612,7 @@ mod tests {
     enum BlockEvent {
         Started,
         Cancelled,
+        Canonical(B256),
     }
 
     #[async_trait::async_trait]
@@ -630,6 +639,10 @@ mod tests {
                 // Small sleep to prevent tight loop
                 std::thread::sleep(Duration::from_millis(10));
             }
+        }
+
+        fn on_new_canonical_block(&self, block_hash: B256) {
+            self.new_event(BlockEvent::Canonical(block_hash));
         }
     }
 
@@ -711,6 +724,50 @@ mod tests {
             let events = builder.get_events();
             assert_eq!(events, vec![BlockEvent::Started, BlockEvent::Cancelled]);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_payload_generator_notifies_builder_on_new_canonical_block() -> eyre::Result<()> {
+        let client = MockEthProvider::default();
+        let executor = TokioTaskExecutor::default();
+        let config = BasicPayloadJobGeneratorConfig::default();
+        let builder = MockBuilder::<OpPrimitives>::new();
+
+        let sealed_block =
+            alloy_consensus::Block::<reth_optimism_primitives::OpTransactionSigned>::new(
+                Header::default(),
+                BlockBody {
+                    transactions: vec![],
+                    ommers: vec![],
+                    withdrawals: None,
+                },
+            )
+            .seal_slow();
+        let block_hash = sealed_block.hash();
+
+        let mut generator = BlockPayloadJobGenerator::with_builder(
+            client,
+            executor,
+            config,
+            builder.clone(),
+            false,
+            std::time::Duration::from_secs(1),
+        );
+
+        let committed: CanonStateNotification<OpPrimitives> = CanonStateNotification::Commit {
+            new: Arc::new(Chain::from_block(
+                RecoveredBlock::new_sealed(sealed_block, Vec::<Address>::new()),
+                Default::default(),
+                LazyTrieData::from_sorted(Default::default()),
+            )),
+        };
+
+        generator.on_new_state(committed);
+
+        let events = builder.get_events();
+        assert_eq!(events, vec![BlockEvent::Canonical(block_hash)]);
 
         Ok(())
     }
