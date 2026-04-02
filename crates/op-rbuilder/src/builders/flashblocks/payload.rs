@@ -829,13 +829,43 @@ where
                     current_nonces.insert(sender, nonce);
                 }
 
-                if let Some(xt_instance) = self
+                let executable_instance = self
                     .config
                     .xt_pool
                     .collect_executable_instances(&current_nonces)
                     .into_iter()
-                    .next()
-                {
+                    .next();
+
+                if executable_instance.is_none() {
+                    if let Some(blocked) = self
+                        .config
+                        .xt_pool
+                        .first_blocked_instance_reason(&current_nonces)
+                    {
+                        info!(
+                            target: "payload_builder",
+                            instance_id = %blocked.instance_id,
+                            sender = ?blocked.sender,
+                            phase = blocked.phase,
+                            status = blocked.status,
+                            tx_index = blocked.tx_index,
+                            entry_nonce = blocked.entry_nonce,
+                            current_nonce = ?blocked.current_nonce,
+                            ?blocked.tx_hash,
+                            reason = blocked.reason,
+                            "Ethera XT instance is not executable in current flashblock state"
+                        );
+                    }
+                }
+
+                if let Some(xt_instance) = executable_instance {
+                    info!(
+                        target: "payload_builder",
+                        instance_id = %xt_instance.instance_id,
+                        tx_count = xt_instance.transactions.len(),
+                        sender_count = xt_instance.senders.len(),
+                        "Selected Ethera XT instance for flashblock execution"
+                    );
                     if ctx.xt_instance_fits(
                         info,
                         &xt_instance,
@@ -854,6 +884,11 @@ where
                             continue;
                         }
                         newly_executed_instance_ids.push(xt_instance.instance_id.clone());
+                        info!(
+                            target: "payload_builder",
+                            instance_id = %xt_instance.instance_id,
+                            "Executed Ethera XT instance in candidate flashblock and queued canonical tracking"
+                        );
                         made_progress = true;
 
                         // Ethera: drain pool txs from XT senders that are now unblocked.
