@@ -769,12 +769,164 @@ where
         let tx_execution_start_time = Instant::now();
         let mut newly_executed_instance_ids: Vec<String> = Vec::new();
 
+        // Ethera SCP: execute released cross-rollup transactions before any
+        // mempool transaction of this flashblock.
+        //
+        // Safety invariant: the state observed during simulation must equal
+        // the pre-state of execution, otherwise the mailbox messages emitted
+        // on chain diverge from those peer sidecars verified. Sidecars trace
+        // each XT against the `pending` block tag, which on this builder
+        // resolves to the post-state of the most recently published
+        // flashblock. Reserving the leading slot of every flashblock for XT
+        // execution preserves that equality: no mempool transaction of the
+        // current flashblock has touched state at this point in the build.
+        //
+        // After XT execution we drain pool transactions from XT senders
+        // whose reserved nonces were just consumed, so the remainder of the
+        // block can advance their nonce chain.
+        //
+        // Liveness caveat: if the 2PC roundtrip (vote → decide → release)
+        // outlasts one flashblock interval, an intermediate flashblock may
+        // advance state past the snapshot the sidecar voted on. The EVM
+        // surfaces the divergence in `execute_xt_transactions` and the
+        // instance is aborted; it is never committed against a state peers
+        // did not verify.
+        {
+            let xt_gas_limit = target_gas_for_batch.min(ctx.block_gas_limit());
+            let mut xt_senders: BTreeSet<Address> = BTreeSet::new();
+
+            loop {
+                let active_senders = self.config.xt_pool.active_senders();
+                if active_senders.is_empty() {
+                    break;
+                }
+
+                let mut current_nonces = HashMap::with_capacity(active_senders.len());
+                for sender in active_senders {
+                    let nonce = state
+                        .load_cache_account(sender)
+                        .map(|account| account.account_info().unwrap_or_default().nonce)
+                        .map_err(|_| {
+                            PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
+                                sender,
+                            ))
+                        })?;
+                    current_nonces.insert(sender, nonce);
+                }
+
+                let Some(xt_instance) = self
+                    .config
+                    .xt_pool
+                    .collect_executable_instances(&current_nonces)
+                    .into_iter()
+                    .next()
+                else {
+                    if let Some(blocked) = self
+                        .config
+                        .xt_pool
+                        .first_blocked_instance_reason(&current_nonces)
+                    {
+                        info!(
+                            target: "payload_builder",
+                            instance_id = %blocked.instance_id,
+                            sender = ?blocked.sender,
+                            phase = blocked.phase,
+                            status = blocked.status,
+                            tx_index = blocked.tx_index,
+                            entry_nonce = blocked.entry_nonce,
+                            current_nonce = ?blocked.current_nonce,
+                            ?blocked.tx_hash,
+                            reason = blocked.reason,
+                            "Ethera XT instance is not executable in current flashblock state"
+                        );
+                    }
+                    break;
+                };
+
+                if !ctx.xt_instance_fits(
+                    info,
+                    &xt_instance,
+                    xt_gas_limit,
+                    target_da_for_batch,
+                    target_da_footprint_for_batch,
+                )? {
+                    break;
+                }
+
+                info!(
+                    target: "payload_builder",
+                    instance_id = %xt_instance.instance_id,
+                    tx_count = xt_instance.transactions.len(),
+                    sender_count = xt_instance.senders.len(),
+                    "Selected Ethera XT instance for flashblock execution"
+                );
+
+                if let Err(err) = ctx.execute_xt_transactions(info, state, &xt_instance) {
+                    warn!(
+                        target: "payload_builder",
+                        instance_id = %xt_instance.instance_id,
+                        %err,
+                        "Ethera XT execution failed, aborting instance and continuing"
+                    );
+                    self.config.xt_pool.abort(&xt_instance.instance_id);
+                    continue;
+                }
+
+                info!(
+                    target: "payload_builder",
+                    instance_id = %xt_instance.instance_id,
+                    "Executed Ethera XT instance against pre-pool state"
+                );
+                xt_senders.extend(xt_instance.senders.iter().copied());
+                newly_executed_instance_ids.push(xt_instance.instance_id);
+            }
+
+            if block_cancel.is_cancelled() {
+                return Ok(None);
+            }
+
+            // Drain queued pool txs whose nonces were unblocked by the XTs
+            // we just ran. The txpool uses canonical nonces, so these appear
+            // "queued" (not "pending") and would be skipped by the normal
+            // best_transactions iterator. Running them here keeps the nonce
+            // chain live for the rest of the block.
+            for sender in xt_senders {
+                let evm_nonce = state
+                    .load_cache_account(sender)
+                    .map(|acct| acct.account_info().unwrap_or_default().nonce)
+                    .map_err(|_| {
+                        PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
+                            sender,
+                        ))
+                    })?;
+
+                let mut queued = self.pool.get_queued_transactions_by_sender(sender);
+                queued.sort_by_key(|tx| tx.nonce());
+                let consecutive: Vec<_> = queued
+                    .into_iter()
+                    .scan(evm_nonce, |expected, tx| {
+                        if tx.nonce() == *expected {
+                            *expected += 1;
+                            Some(tx)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let committed =
+                    ctx.execute_unblocked_pool_txs(info, state, &consecutive, xt_gas_limit)?;
+                if !committed.is_empty() {
+                    best_txs.mark_commited(committed);
+                }
+            }
+        }
+        // ===== End Ethera ====================================================
+
         loop {
             let mut made_progress = false;
             let executed_before = info.executed_transactions.len();
 
-            // Execute pool transactions first so released XT reservations observe the
-            // current flashblock state.
             let best_txs_start_time = Instant::now();
             best_txs.refresh_iterator(
                 BestPayloadTransactions::new(
@@ -810,131 +962,8 @@ where
                 made_progress = true;
             }
 
-            // We got block cancelled, we won't need anything from the block at this point
-            // Caution: this assume that block cancel token only cancelled when new FCU is received
             if block_cancel.is_cancelled() {
                 return Ok(None);
-            }
-
-            let active_senders = self.config.xt_pool.active_senders();
-            if !active_senders.is_empty() {
-                let mut current_nonces = HashMap::with_capacity(active_senders.len());
-                for sender in active_senders {
-                    let nonce = state
-                        .load_cache_account(sender)
-                        .map(|account| account.account_info().unwrap_or_default().nonce)
-                        .map_err(|_| {
-                            PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(sender))
-                        })?;
-                    current_nonces.insert(sender, nonce);
-                }
-
-                let executable_instance = self
-                    .config
-                    .xt_pool
-                    .collect_executable_instances(&current_nonces)
-                    .into_iter()
-                    .next();
-
-                if executable_instance.is_none() {
-                    if let Some(blocked) = self
-                        .config
-                        .xt_pool
-                        .first_blocked_instance_reason(&current_nonces)
-                    {
-                        info!(
-                            target: "payload_builder",
-                            instance_id = %blocked.instance_id,
-                            sender = ?blocked.sender,
-                            phase = blocked.phase,
-                            status = blocked.status,
-                            tx_index = blocked.tx_index,
-                            entry_nonce = blocked.entry_nonce,
-                            current_nonce = ?blocked.current_nonce,
-                            ?blocked.tx_hash,
-                            reason = blocked.reason,
-                            "Ethera XT instance is not executable in current flashblock state"
-                        );
-                    }
-                }
-
-                if let Some(xt_instance) = executable_instance {
-                    info!(
-                        target: "payload_builder",
-                        instance_id = %xt_instance.instance_id,
-                        tx_count = xt_instance.transactions.len(),
-                        sender_count = xt_instance.senders.len(),
-                        "Selected Ethera XT instance for flashblock execution"
-                    );
-                    if ctx.xt_instance_fits(
-                        info,
-                        &xt_instance,
-                        target_gas_for_batch.min(ctx.block_gas_limit()),
-                        target_da_for_batch,
-                        target_da_footprint_for_batch,
-                    )? {
-                        if let Err(err) = ctx.execute_xt_transactions(info, state, &xt_instance) {
-                            warn!(
-                                target: "payload_builder",
-                                instance_id = %xt_instance.instance_id,
-                                %err,
-                                "XT execution failed, aborting instance and continuing"
-                            );
-                            self.config.xt_pool.abort(&xt_instance.instance_id);
-                            continue;
-                        }
-                        newly_executed_instance_ids.push(xt_instance.instance_id.clone());
-                        info!(
-                            target: "payload_builder",
-                            instance_id = %xt_instance.instance_id,
-                            "Executed Ethera XT instance in candidate flashblock and queued canonical tracking"
-                        );
-                        made_progress = true;
-
-                        // Ethera: drain pool txs from XT senders that are now unblocked.
-                        // The pool uses canonical chain nonces so txs whose nonce just became
-                        // reachable due to this XT executing mid-block appear "queued" (not
-                        // "pending") and won't be returned by best_transactions_with_attributes.
-                        // Executing them here keeps the nonce chain live so the next XT in this
-                        // sender's sequence can execute within the same flashblock.
-                        let gas_limit = target_gas_for_batch.min(ctx.block_gas_limit());
-                        for &sender in &xt_instance.senders {
-                            let evm_nonce = state
-                                .load_cache_account(sender)
-                                .map(|acct| acct.account_info().unwrap_or_default().nonce)
-                                .map_err(|_| {
-                                    PayloadBuilderError::other(
-                                        OpPayloadBuilderError::AccountLoadFailed(sender),
-                                    )
-                                })?;
-
-                            let mut queued =
-                                self.pool.get_queued_transactions_by_sender(sender);
-                            queued.sort_by_key(|tx| tx.nonce());
-                            let consecutive: Vec<_> = queued
-                                .into_iter()
-                                .scan(evm_nonce, |expected, tx| {
-                                    if tx.nonce() == *expected {
-                                        *expected += 1;
-                                        Some(tx)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            let committed = ctx.execute_unblocked_pool_txs(
-                                info,
-                                state,
-                                &consecutive,
-                                gas_limit,
-                            )?;
-                            if !committed.is_empty() {
-                                best_txs.mark_commited(committed);
-                            }
-                        }
-                    }
-                }
             }
 
             if !made_progress {
