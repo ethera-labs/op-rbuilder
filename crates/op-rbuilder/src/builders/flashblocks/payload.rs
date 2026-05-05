@@ -773,8 +773,7 @@ where
             let mut made_progress = false;
             let executed_before = info.executed_transactions.len();
 
-            // Execute pool transactions first so released XT reservations observe the
-            // current flashblock state.
+            // The pool gate is enforced per-tx inside `BestFlashblocksTxs::next`.
             let best_txs_start_time = Instant::now();
             best_txs.refresh_iterator(
                 BestPayloadTransactions::new(
@@ -884,6 +883,13 @@ where
                             continue;
                         }
                         newly_executed_instance_ids.push(xt_instance.instance_id.clone());
+                        // Lift the pool gate now that the executor's post-state
+                        // includes this XT. Independent of canonical
+                        // `mark_included` so that the gate is not held across
+                        // reorg-driven status rewinds.
+                        self.config
+                            .xt_pool
+                            .note_executed(&xt_instance.instance_id);
                         info!(
                             target: "payload_builder",
                             instance_id = %xt_instance.instance_id,

@@ -5,7 +5,7 @@ use alloy_primitives::{Address, Bytes, TxHash};
 use op_alloy_consensus::OpTxEnvelope;
 use parking_lot::RwLock;
 use reth_primitives_traits::SignedTransaction;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 use tracing::info;
 
@@ -114,6 +114,15 @@ struct XtPoolState {
     by_instance: HashMap<String, XtInstance>,
     ordered_instances: BTreeSet<(XtOrderKey, String)>,
     by_sender: HashMap<Address, SenderReservations>,
+    /// Chain-wide pool inclusion gate. Holds the IDs of in-flight XT instances
+    /// from the moment `submit_locked` arrives until the builder either
+    /// physically executes the instance (`note_executed`) or aborts it. While
+    /// non-empty, mempool txs from senders not participating in any in-flight
+    /// instance are skipped during flashblock build, keeping the executor's
+    /// pre-state aligned with the sidecar's simulation baseline. A set rather
+    /// than a counter so the gate is resilient to duplicate submit/abort and
+    /// to retried `note_executed` calls.
+    pool_gate: HashSet<String>,
 }
 
 impl XtPoolState {
@@ -232,6 +241,9 @@ impl XtPool {
                 .cloned()
                 .collect::<Vec<_>>();
             if same_reservations(&existing_xt, &reservations) {
+                // Idempotent re-submit: do not re-close the gate. If
+                // `note_executed` has already lifted it, the original
+                // submit-to-execute window is what mattered.
                 return Ok(());
             }
             return Err(XtPoolError::InstanceMismatch(request.instance_id));
@@ -248,6 +260,10 @@ impl XtPool {
         }
 
         let senders = unique_senders(&reservations);
+        // Close the pool gate atomically with the instance becoming visible.
+        // Lifted by `note_executed` after the XT runs in a flashblock, or by
+        // `abort` if the round is decided to abort.
+        state.pool_gate.insert(request.instance_id.clone());
         state.insert_instance(request.instance_id, request.order, reservations);
         state.rebuild_senders(senders);
         Ok(())
@@ -337,10 +353,30 @@ impl XtPool {
 
     pub fn abort(&self, instance_id: &str) {
         let mut state = self.inner.write();
+        // Always clear the gate, even if the instance was never submitted, so
+        // an abort racing the submit cannot strand the gate closed.
+        state.pool_gate.remove(instance_id);
         let Some(instance) = state.remove_instance(instance_id) else {
             return;
         };
         state.rebuild_senders(instance.senders);
+    }
+
+    /// Lift the pool gate for `instance_id` once the builder has physically
+    /// executed it inside a flashblock. Called from the flashblock build path
+    /// after `execute_xt_transactions` succeeds. Independent of
+    /// `mark_included` (which tracks canonical confirmation) so that reorgs
+    /// of nonce-reservation status do not have to coordinate with the gate.
+    pub fn note_executed(&self, instance_id: &str) {
+        let mut state = self.inner.write();
+        state.pool_gate.remove(instance_id);
+    }
+
+    /// Returns true while at least one in-flight XT is holding the pool gate
+    /// closed. While true, mempool txs from senders without an in-flight XT
+    /// reservation are skipped during flashblock build.
+    pub fn pool_gate_closed(&self) -> bool {
+        !self.inner.read().pool_gate.is_empty()
     }
 
     pub fn mark_included(&self, instance_ids: &[String]) {
@@ -385,6 +421,20 @@ impl XtPool {
             .get(&sender)
             .and_then(|reservations| reservations.by_nonce.get(&nonce))
             .is_some_and(|reservation| reservation.status.reserves_nonce())
+    }
+
+    /// Returns true while `sender` has at least one in-flight XT reservation
+    /// that blocks pool inclusion at some nonce. Used by the flashblock pool
+    /// iterator to allow pool txs from such senders even when the pool gate
+    /// is closed, so an XT can wait for a predecessor pool tx to advance the
+    /// sender's on-chain nonce. Per-nonce conflicts are still rejected by
+    /// `has_blocking_nonce`.
+    pub fn is_active_sender(&self, sender: Address) -> bool {
+        self.inner
+            .read()
+            .by_sender
+            .get(&sender)
+            .is_some_and(|reservations| reservations.blocking_count > 0)
     }
 
     pub fn has_blocking_nonce(&self, sender: Address, nonce: u64) -> bool {
@@ -761,5 +811,135 @@ mod tests {
 
         let executable = pool.collect_executable_instances(&HashMap::from([(user.address(), 0)]));
         assert!(executable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pool_gate_closes_on_submit_and_lifts_on_note_executed() {
+        let pool = XtPool::default();
+        let user = PrivateKeySigner::random();
+        let xt_tx = signed_tx(&user, 0, Address::repeat_byte(0x88)).await;
+
+        assert!(!pool.pool_gate_closed());
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "gate-1".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 1,
+            },
+            transactions: vec![xt_tx],
+        })
+        .unwrap();
+        assert!(pool.pool_gate_closed(), "submit_locked must close the gate");
+
+        // Release flips status Locked → Released but the gate stays closed
+        // because the executor has not yet run the xT.
+        pool.release(ReleaseXtRequest {
+            instance_id: "gate-1".to_string(),
+            transactions: Vec::new(),
+        })
+        .unwrap();
+        assert!(
+            pool.pool_gate_closed(),
+            "release alone must not lift the gate; only execution does"
+        );
+
+        pool.note_executed("gate-1");
+        assert!(
+            !pool.pool_gate_closed(),
+            "note_executed lifts the gate after physical execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_gate_lifts_on_abort_even_before_submit() {
+        let pool = XtPool::default();
+        let user = PrivateKeySigner::random();
+        let xt_tx = signed_tx(&user, 0, Address::repeat_byte(0x99)).await;
+
+        // Abort racing ahead of submit must not strand the gate closed.
+        pool.abort("phantom");
+        assert!(!pool.pool_gate_closed());
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "gate-2".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 2,
+            },
+            transactions: vec![xt_tx],
+        })
+        .unwrap();
+        assert!(pool.pool_gate_closed());
+
+        pool.abort("gate-2");
+        assert!(!pool.pool_gate_closed(), "abort must lift the gate");
+    }
+
+    #[tokio::test]
+    async fn pool_gate_stays_closed_until_every_in_flight_instance_clears() {
+        let pool = XtPool::default();
+        let user_a = PrivateKeySigner::random();
+        let user_b = PrivateKeySigner::random();
+        let tx_a = signed_tx(&user_a, 0, Address::repeat_byte(0xaa)).await;
+        let tx_b = signed_tx(&user_b, 0, Address::repeat_byte(0xbb)).await;
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "gate-3a".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 3,
+            },
+            transactions: vec![tx_a],
+        })
+        .unwrap();
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "gate-3b".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 4,
+            },
+            transactions: vec![tx_b],
+        })
+        .unwrap();
+        assert!(pool.pool_gate_closed());
+
+        pool.note_executed("gate-3a");
+        assert!(
+            pool.pool_gate_closed(),
+            "gate must remain closed while any in-flight instance is unexecuted"
+        );
+
+        pool.note_executed("gate-3b");
+        assert!(
+            !pool.pool_gate_closed(),
+            "gate must lift only after the last in-flight instance executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_does_not_reclose_gate_after_execution() {
+        let pool = XtPool::default();
+        let user = PrivateKeySigner::random();
+        let xt_tx = signed_tx(&user, 0, Address::repeat_byte(0xcc)).await;
+
+        let request = SubmitXtRequest {
+            instance_id: "gate-4".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 5,
+            },
+            transactions: vec![xt_tx],
+        };
+
+        pool.submit_locked(request.clone()).unwrap();
+        pool.note_executed("gate-4");
+        assert!(!pool.pool_gate_closed());
+
+        // Idempotent retry of the same submit (e.g. publisher resend) must not
+        // re-close the gate: the simulation invariant is bound to the original
+        // submit-to-execute window, not to retries.
+        pool.submit_locked(request).unwrap();
+        assert!(!pool.pool_gate_closed());
     }
 }

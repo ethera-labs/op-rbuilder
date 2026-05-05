@@ -73,6 +73,18 @@ where
                 continue;
             }
 
+            // While an XT is in flight, hold back mempool txs from senders
+            // that aren't participating in any in-flight XT — they would
+            // drift the executor's pre-state away from the sidecar's
+            // simulation baseline. Pool txs from XT-participating senders
+            // are still allowed: they may be predecessor nonces the XT is
+            // waiting on, and per-nonce conflicts are rejected above.
+            // Skipped without `mark_invalid` so the tx is reconsidered once
+            // the gate lifts.
+            if self.xt_pool.pool_gate_closed() && !self.xt_pool.is_active_sender(tx.sender()) {
+                continue;
+            }
+
             let flashblock_number_min = tx.flashblock_number_min();
             let flashblock_number_max = tx.flashblock_number_max();
 
