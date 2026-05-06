@@ -372,6 +372,23 @@ impl XtPool {
         state.pool_gate.remove(instance_id);
     }
 
+    /// Re-close the pool gate for instances that executed in a candidate
+    /// flashblock that was later abandoned before publication. This restores
+    /// the submit-to-execute lock without resurrecting already aborted
+    /// instances.
+    pub fn restore_gate(&self, instance_ids: &[String]) {
+        if instance_ids.is_empty() {
+            return;
+        }
+
+        let mut state = self.inner.write();
+        for instance_id in instance_ids {
+            if state.by_instance.contains_key(instance_id) {
+                state.pool_gate.insert(instance_id.clone());
+            }
+        }
+    }
+
     /// Returns true while at least one in-flight XT is holding the pool gate
     /// closed. While true, mempool txs from senders without an in-flight XT
     /// reservation are skipped during flashblock build.
@@ -435,6 +452,19 @@ impl XtPool {
             .by_sender
             .get(&sender)
             .is_some_and(|reservations| reservations.blocking_count > 0)
+    }
+
+    /// Returns true if the pool gate is closed and this sender is unrelated
+    /// to every in-flight XT reservation. The flashblock pool iterator skips
+    /// such txs without marking them invalid so they can be reconsidered as
+    /// soon as the gate lifts.
+    pub fn should_hold_pool_tx(&self, sender: Address) -> bool {
+        let state = self.inner.read();
+        !state.pool_gate.is_empty()
+            && !state
+                .by_sender
+                .get(&sender)
+                .is_some_and(|reservations| reservations.blocking_count > 0)
     }
 
     pub fn has_blocking_nonce(&self, sender: Address, nonce: u64) -> bool {
@@ -941,5 +971,43 @@ mod tests {
         // submit-to-execute window, not to retries.
         pool.submit_locked(request).unwrap();
         assert!(!pool.pool_gate_closed());
+    }
+
+    #[tokio::test]
+    async fn restore_gate_recloses_only_live_instances() {
+        let pool = XtPool::default();
+        let user = PrivateKeySigner::random();
+        let xt_tx = signed_tx(&user, 0, Address::repeat_byte(0xdd)).await;
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "gate-5".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 6,
+            },
+            transactions: vec![xt_tx],
+        })
+        .unwrap();
+        pool.note_executed("gate-5");
+        assert!(!pool.pool_gate_closed());
+
+        pool.restore_gate(&["missing".to_string()]);
+        assert!(
+            !pool.pool_gate_closed(),
+            "abandoned candidates must not resurrect unknown instances"
+        );
+
+        pool.restore_gate(&["gate-5".to_string()]);
+        assert!(
+            pool.pool_gate_closed(),
+            "abandoned candidates re-close the gate for live XT reservations"
+        );
+
+        pool.abort("gate-5");
+        pool.restore_gate(&["gate-5".to_string()]);
+        assert!(
+            !pool.pool_gate_closed(),
+            "aborted instances must not be restored into the gate"
+        );
     }
 }

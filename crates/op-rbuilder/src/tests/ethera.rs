@@ -1,7 +1,7 @@
 use crate::{
     args::{FlashblocksArgs, OpRbuilderArgs},
     ethera::{ReleaseXtRequest, SubmitXtRequest, XtOrderKey},
-    tests::{funded_signer, BlockTransactionsExt, LocalInstance, TransactionBuilderExt},
+    tests::{BlockTransactionsExt, LocalInstance, TransactionBuilderExt, funded_signer},
 };
 use alloy_consensus::Transaction;
 use alloy_eips::Encodable2718;

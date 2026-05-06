@@ -7,7 +7,7 @@ use crate::{
         flashblocks::{best_txs::BestFlashblocksTxs, config::FlashBlocksConfigExt},
         generator::{BlockCell, BuildArguments, PayloadBuilder},
     },
-    ethera::XtCanonicalTracker,
+    ethera::{ExecutedXtGateGuard, XtCanonicalTracker},
     gas_limiter::AddressGasLimiter,
     metrics::OpRBuilderMetrics,
     primitives::reth::ExecutionInfo,
@@ -767,7 +767,7 @@ where
         }
 
         let tx_execution_start_time = Instant::now();
-        let mut newly_executed_instance_ids: Vec<String> = Vec::new();
+        let mut executed_xt_gate = ExecutedXtGateGuard::new(Arc::clone(&self.config.xt_pool));
 
         loop {
             let mut made_progress = false;
@@ -823,7 +823,9 @@ where
                         .load_cache_account(sender)
                         .map(|account| account.account_info().unwrap_or_default().nonce)
                         .map_err(|_| {
-                            PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(sender))
+                            PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
+                                sender,
+                            ))
                         })?;
                     current_nonces.insert(sender, nonce);
                 }
@@ -872,24 +874,18 @@ where
                         target_da_for_batch,
                         target_da_footprint_for_batch,
                     )? {
-                        if let Err(err) = ctx.execute_xt_transactions(info, state, &xt_instance) {
-                            warn!(
-                                target: "payload_builder",
-                                instance_id = %xt_instance.instance_id,
-                                %err,
-                                "XT execution failed, aborting instance and continuing"
-                            );
-                            self.config.xt_pool.abort(&xt_instance.instance_id);
-                            continue;
-                        }
-                        newly_executed_instance_ids.push(xt_instance.instance_id.clone());
+                        ctx.execute_xt_transactions(info, state, &xt_instance)
+                            .wrap_err_with(|| {
+                                format!(
+                                    "committed XT instance {} failed during flashblock execution",
+                                    xt_instance.instance_id
+                                )
+                            })?;
                         // Lift the pool gate now that the executor's post-state
                         // includes this XT. Independent of canonical
                         // `mark_included` so that the gate is not held across
                         // reorg-driven status rewinds.
-                        self.config
-                            .xt_pool
-                            .note_executed(&xt_instance.instance_id);
+                        executed_xt_gate.note_executed(xt_instance.instance_id.clone());
                         info!(
                             target: "payload_builder",
                             instance_id = %xt_instance.instance_id,
@@ -914,8 +910,7 @@ where
                                     )
                                 })?;
 
-                            let mut queued =
-                                self.pool.get_queued_transactions_by_sender(sender);
+                            let mut queued = self.pool.get_queued_transactions_by_sender(sender);
                             queued.sort_by_key(|tx| tx.nonce());
                             let consecutive: Vec<_> = queued
                                 .into_iter()
@@ -993,13 +988,15 @@ where
                 if block_cancel.is_cancelled() {
                     return Ok(None);
                 }
-                let flashblock_byte_size = self
-                    .ws_pub
-                    .publish(&fb_payload)
-                    .wrap_err("failed to publish flashblock via websocket")?;
-                self.payload_tx
-                    .try_send(new_payload.clone())
-                    .wrap_err("failed to send built payload to handler")?;
+                let flashblock_byte_size = match self.ws_pub.publish(&fb_payload) {
+                    Ok(size) => size,
+                    Err(err) => {
+                        return Err(err).wrap_err("failed to publish flashblock via websocket");
+                    }
+                };
+                if let Err(err) = self.payload_tx.try_send(new_payload.clone()) {
+                    return Err(err).wrap_err("failed to send built payload to handler");
+                }
                 best_payload.set(new_payload);
 
                 // Record flashblock build duration
@@ -1049,6 +1046,7 @@ where
                     target_flashblocks = ctx.target_flashblock_count(),
                 );
 
+                let newly_executed_instance_ids = executed_xt_gate.disarm();
                 Ok(Some((
                     next_extra_ctx,
                     candidate_block_hash,
