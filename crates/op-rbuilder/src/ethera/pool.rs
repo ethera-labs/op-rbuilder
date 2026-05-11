@@ -295,6 +295,30 @@ impl XtPool {
         )?;
 
         if existing_put_inbox.is_empty() {
+            let stale_instances: BTreeSet<_> = released_put_inbox
+                .iter()
+                .filter_map(|reservation| {
+                    stale_released_put_inbox_owner(&state, &request.instance_id, order, reservation)
+                })
+                .collect();
+
+            if !stale_instances.is_empty() {
+                let mut touched_senders = BTreeSet::new();
+                for stale_instance_id in &stale_instances {
+                    state.pool_gate.remove(stale_instance_id);
+                    if let Some(instance) = state.remove_instance(stale_instance_id) {
+                        touched_senders.extend(instance.senders);
+                    }
+                }
+                state.rebuild_senders(touched_senders);
+                info!(
+                    target: "ethera_xt",
+                    instance_id = %request.instance_id,
+                    evicted_instances = stale_instances.len(),
+                    "Evicted stale released XT reservations that conflicted with putInbox nonce lane"
+                );
+            }
+
             for reservation in &released_put_inbox {
                 if conflicts_with_pending(&state, &request.instance_id, reservation) {
                     return Err(XtPoolError::NonceConflict {
@@ -667,6 +691,52 @@ fn conflicts_with_pending(
         })
 }
 
+fn released_entries_only(instance: &XtInstance) -> bool {
+    instance
+        .entries
+        .iter()
+        .all(|entry| entry.status == XtEntryStatus::Released)
+}
+
+fn stale_released_put_inbox_owner(
+    state: &XtPoolState,
+    current_instance_id: &str,
+    current_order: XtOrderKey,
+    reservation: &XtReservation,
+) -> Option<String> {
+    let existing = state
+        .by_sender
+        .get(&reservation.sender)?
+        .by_nonce
+        .get(&reservation.nonce)?;
+
+    if existing.instance_id == current_instance_id && existing.tx_hash == reservation.tx_hash {
+        return None;
+    }
+
+    let existing_instance = state.by_instance.get(&existing.instance_id)?;
+    let existing_entry = existing_instance.entries.iter().find(|entry| {
+        entry.tx_hash == existing.tx_hash
+            && entry.sender == reservation.sender
+            && entry.nonce == reservation.nonce
+    })?;
+
+    // Edge case: sidecar can forget a previously released XT after restart or
+    // cleanup while the builder still holds its released putInbox reservation.
+    // If a newer XT exact-resyncs the coordinator signer back to canonical
+    // nonce 0, the system deadlocks unless the builder evicts the stale owner
+    // of that putInbox nonce lane.
+    if existing_entry.phase == XtReservationPhase::PutInbox
+        && existing.status == XtEntryStatus::Released
+        && existing_instance.order < current_order
+        && released_entries_only(existing_instance)
+    {
+        return Some(existing.instance_id.clone());
+    }
+
+    None
+}
+
 fn same_reservations(existing: &[XtReservation], incoming: &[XtReservation]) -> bool {
     existing.len() == incoming.len()
         && existing.iter().zip(incoming).all(|(left, right)| {
@@ -780,6 +850,102 @@ mod tests {
         ]));
         assert_eq!(executable.len(), 1);
         assert_eq!(executable[0].transactions, vec![put_inbox_tx, xt_tx]);
+    }
+
+    #[tokio::test]
+    async fn newer_release_evicts_older_released_put_inbox_conflict() {
+        let pool = XtPool::default();
+        let old_user = PrivateKeySigner::random();
+        let new_user = PrivateKeySigner::random();
+        let coordinator = PrivateKeySigner::random();
+        let old_xt_tx = signed_tx(&old_user, 0, Address::repeat_byte(0x45)).await;
+        let new_xt_tx = signed_tx(&new_user, 0, Address::repeat_byte(0x46)).await;
+        let old_put_inbox = signed_tx(&coordinator, 0, Address::repeat_byte(0x47)).await;
+        let new_put_inbox = signed_tx(&coordinator, 0, Address::repeat_byte(0x48)).await;
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "old".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 1,
+            },
+            transactions: vec![old_xt_tx],
+        })
+        .unwrap();
+        pool.release(ReleaseXtRequest {
+            instance_id: "old".to_string(),
+            transactions: vec![old_put_inbox],
+        })
+        .unwrap();
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "new".to_string(),
+            order: XtOrderKey {
+                period_id: 2,
+                sequence_number: 1,
+            },
+            transactions: vec![new_xt_tx.clone()],
+        })
+        .unwrap();
+        pool.release(ReleaseXtRequest {
+            instance_id: "new".to_string(),
+            transactions: vec![new_put_inbox.clone()],
+        })
+        .unwrap();
+
+        let executable = pool.collect_executable_instances(&HashMap::from([
+            (coordinator.address(), 0),
+            (old_user.address(), 0),
+            (new_user.address(), 0),
+        ]));
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].instance_id, "new");
+        assert_eq!(executable[0].transactions, vec![new_put_inbox, new_xt_tx]);
+    }
+
+    #[tokio::test]
+    async fn older_release_cannot_evict_newer_released_put_inbox_conflict() {
+        let pool = XtPool::default();
+        let older_user = PrivateKeySigner::random();
+        let newer_user = PrivateKeySigner::random();
+        let coordinator = PrivateKeySigner::random();
+        let newer_xt_tx = signed_tx(&newer_user, 0, Address::repeat_byte(0x49)).await;
+        let older_xt_tx = signed_tx(&older_user, 0, Address::repeat_byte(0x4a)).await;
+        let newer_put_inbox = signed_tx(&coordinator, 0, Address::repeat_byte(0x4b)).await;
+        let older_put_inbox = signed_tx(&coordinator, 0, Address::repeat_byte(0x4c)).await;
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "newer".to_string(),
+            order: XtOrderKey {
+                period_id: 2,
+                sequence_number: 1,
+            },
+            transactions: vec![newer_xt_tx],
+        })
+        .unwrap();
+        pool.release(ReleaseXtRequest {
+            instance_id: "newer".to_string(),
+            transactions: vec![newer_put_inbox],
+        })
+        .unwrap();
+
+        pool.submit_locked(SubmitXtRequest {
+            instance_id: "older".to_string(),
+            order: XtOrderKey {
+                period_id: 1,
+                sequence_number: 1,
+            },
+            transactions: vec![older_xt_tx],
+        })
+        .unwrap();
+        let err = pool
+            .release(ReleaseXtRequest {
+                instance_id: "older".to_string(),
+                transactions: vec![older_put_inbox],
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, XtPoolError::NonceConflict { .. }));
     }
 
     #[tokio::test]
