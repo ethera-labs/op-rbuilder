@@ -688,17 +688,15 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
             let tx_hash = tx.tx_hash();
             let tx_da_size =
                 op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
-            if let Err(err) = projected
-                .is_tx_over_limits(
-                    tx_da_size,
-                    block_gas_limit,
-                    tx_da_limit,
-                    block_da_limit,
-                    tx.gas_limit(),
-                    info.da_footprint_scalar,
-                    block_da_footprint_limit,
-                )
-            {
+            if let Err(err) = projected.is_tx_over_limits(
+                tx_da_size,
+                block_gas_limit,
+                tx_da_limit,
+                block_da_limit,
+                tx.gas_limit(),
+                info.da_footprint_scalar,
+                block_da_footprint_limit,
+            ) {
                 info!(
                     target: "payload_builder",
                     instance_id = %xt_instance.instance_id,
@@ -721,8 +719,9 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
             }
             projected.cumulative_gas_used =
                 projected.cumulative_gas_used.saturating_add(tx.gas_limit());
-            projected.cumulative_da_bytes_used =
-                projected.cumulative_da_bytes_used.saturating_add(tx_da_size);
+            projected.cumulative_da_bytes_used = projected
+                .cumulative_da_bytes_used
+                .saturating_add(tx_da_size);
         }
 
         Ok(true)
@@ -751,7 +750,8 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
         for raw in &xt_instance.transactions {
             let tx = self.decode_xt_transaction(&xt_instance.instance_id, raw)?;
             let tx_hash = tx.tx_hash();
-            let tx_da_size = op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
+            let tx_da_size =
+                op_alloy_flz::tx_estimated_size_fjord_bytes(tx.encoded_2718().as_slice());
 
             let ResultAndState { result, state } = match evm.transact(&tx) {
                 Ok(res) => res,

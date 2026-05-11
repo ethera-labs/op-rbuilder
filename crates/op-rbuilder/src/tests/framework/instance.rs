@@ -5,13 +5,13 @@ use crate::{
     primitives::reth::engine_api_builder::OpEngineApiBuilder,
     revert_protection::{EthApiExtServer, RevertProtectionExt},
     tests::{
-        builder_signer, create_test_db, framework::driver::ChainDriver, get_available_port,
-        EngineApi, Ipc, TransactionPoolObserver, TEE_DEBUG_ADDRESS,
+        EngineApi, Ipc, TEE_DEBUG_ADDRESS, TransactionPoolObserver, builder_signer, create_test_db,
+        framework::driver::ChainDriver, get_available_port,
     },
     tx::FBPooledTransaction,
     tx_signer::Signer,
 };
-use alloy_primitives::{hex, keccak256, Address, Bytes, B256};
+use alloy_primitives::{Address, B256, Bytes, hex, keccak256};
 use alloy_provider::{Identity, ProviderBuilder, RootProvider};
 use clap::Parser;
 use core::{
@@ -41,8 +41,8 @@ use reth_node_builder::{NodeBuilder, NodeConfig};
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_cli::commands::Commands;
 use reth_optimism_node::{
-    node::{OpAddOns, OpAddOnsBuilder, OpEngineValidatorBuilder, OpPoolBuilder},
     OpNode,
+    node::{OpAddOns, OpAddOnsBuilder, OpEngineValidatorBuilder, OpPoolBuilder},
 };
 use reth_optimism_rpc::OpEthApiBuilder;
 use reth_transaction_pool::{AllTransactionsEvents, TransactionPool};
