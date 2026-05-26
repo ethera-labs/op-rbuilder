@@ -38,6 +38,4 @@ pub enum XtExecutionError {
     LimitsExceeded(String),
     #[error("XT transaction execution failed: {0}")]
     ExecutionFailed(String),
-    #[error("XT transaction reverted: {0}")]
-    Reverted(String),
 }

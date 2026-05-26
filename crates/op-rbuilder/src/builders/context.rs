@@ -37,7 +37,7 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, ValidPo
 use revm::{DatabaseCommit, context::result::ResultAndState, interpreter::as_u64_saturated};
 use std::{sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     ethera::{ExecutableXtInstance, XtExecutionError},
@@ -769,17 +769,21 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
                 }
             };
 
+            // A reverted XT tx is still included: 2PC has already decided
+            // commit ("add localTxs to block" per SCP), and the EVM unwinds the
+            // tx's internal state while gas/nonce stick. This matches the
+            // standard pool path's revert handling in `execute_best_transactions`
+            // and prevents a single execution-time divergence (typically a
+            // cross-chain mailbox prerequisite missing in canonical order) from
+            // head-of-line blocking every subsequent XT in the period.
             if !result.is_success() {
-                error!(
+                warn!(
                     target: "payload_builder",
                     ?tx_hash,
                     ?result,
                     instance_id = %xt_instance.instance_id,
-                    "Ethera XT transaction reverted during execution"
+                    "Ethera XT transaction reverted; including reverted tx and advancing"
                 );
-                return Err(PayloadBuilderError::other(XtExecutionError::Reverted(
-                    tx_hash.to_string(),
-                )));
             }
 
             let gas_used = result.gas_used();
