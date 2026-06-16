@@ -6,4 +6,4 @@ mod types;
 
 pub use client::SidecarClient;
 pub use config::SidecarConfig;
-pub use types::{ConfirmIncludedRequest, SidecarError};
+pub use types::{CheckTxRequest, CheckTxResponse, ConfirmIncludedRequest, SidecarError};

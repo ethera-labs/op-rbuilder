@@ -144,6 +144,7 @@ impl LocalInstance {
                     xt_pool.clone(),
                     ctx.pool().clone(),
                     ctx.registry.eth_api().clone(),
+                    None,
                 );
                 let mut ethera_rpc = EtheraEthApiServer::into_rpc(ethera_ext.clone());
                 ethera_rpc

@@ -2,6 +2,7 @@ use super::{
     XtPool,
     types::{AbortXtRequest, ReleaseXtRequest, SubmitXtRequest},
 };
+use crate::sidecar::SidecarClient;
 use alloy_consensus::Transaction;
 use alloy_eips::{BlockId, Decodable2718};
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -48,14 +49,21 @@ pub struct EtheraRpcExt<Pool, Eth> {
     xt_pool: Arc<XtPool>,
     pool: Pool,
     eth_api: Eth,
+    permissions: Option<SidecarClient>,
 }
 
 impl<Pool, Eth> EtheraRpcExt<Pool, Eth> {
-    pub fn new(xt_pool: Arc<XtPool>, pool: Pool, eth_api: Eth) -> Self {
+    pub fn new(
+        xt_pool: Arc<XtPool>,
+        pool: Pool,
+        eth_api: Eth,
+        permissions: Option<SidecarClient>,
+    ) -> Self {
         Self {
             xt_pool,
             pool,
             eth_api,
+            permissions,
         }
     }
 }
@@ -145,6 +153,25 @@ where
         let recovered = signed
             .try_clone_into_recovered()
             .map_err(|_| EthApiError::InvalidParams("signature recovery failed".into()))?;
+
+        if let Some(permissions) = &self.permissions {
+            let decision = permissions
+                .check_tx(
+                    recovered.signer(),
+                    recovered.to().is_none(),
+                    !recovered.value().is_zero(),
+                )
+                .await
+                .map_err(|err| {
+                    EthApiError::InvalidParams(format!("permission check unavailable: {err}"))
+                })?;
+            if !decision.allowed {
+                let reason = decision.reason.unwrap_or_else(|| "rejected".to_string());
+                return Err(
+                    EthApiError::InvalidParams(format!("permission denied: {reason}")).into(),
+                );
+            }
+        }
 
         if self
             .xt_pool
