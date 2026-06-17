@@ -9,11 +9,13 @@ use reth_optimism_payload_builder::config::{OpDAConfig, OpGasLimitConfig};
 
 use crate::{
     args::OpRbuilderArgs,
+    ethera::XtPool,
     flashtestations::args::FlashtestationsArgs,
     gas_limiter::args::GasLimiterArgs,
     traits::{NodeBounds, PoolBounds},
     tx_signer::Signer,
 };
+use std::sync::Arc;
 
 mod builder_tx;
 mod context;
@@ -121,6 +123,9 @@ pub struct BuilderConfig<Specific: Clone> {
     /// Configuration values that are specific to the block builder implementation used.
     pub specific: Specific,
 
+    /// Ethera XT reservations shared between the payload builder and RPC layer.
+    pub xt_pool: Arc<XtPool>,
+
     /// Maximum gas a transaction can use before being excluded.
     pub max_gas_per_txn: Option<u64>,
 
@@ -166,6 +171,7 @@ impl<S: Default + Clone> Default for BuilderConfig<S> {
             sampling_ratio: 100,
             max_gas_per_txn: None,
             gas_limiter_config: GasLimiterArgs::default(),
+            xt_pool: Arc::new(XtPool::default()),
         }
     }
 }
@@ -189,6 +195,7 @@ where
             max_gas_per_txn: args.max_gas_per_txn,
             gas_limiter_config: args.gas_limiter.clone(),
             specific: S::try_from(args)?,
+            xt_pool: Arc::new(XtPool::default()),
         })
     }
 }

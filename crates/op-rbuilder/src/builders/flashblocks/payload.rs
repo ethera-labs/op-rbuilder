@@ -7,6 +7,7 @@ use crate::{
         flashblocks::{best_txs::BestFlashblocksTxs, config::FlashBlocksConfigExt},
         generator::{BlockCell, BuildArguments, PayloadBuilder},
     },
+    ethera::{ExecutedXtGateGuard, XtCanonicalTracker},
     gas_limiter::AddressGasLimiter,
     metrics::OpRBuilderMetrics,
     primitives::reth::ExecutionInfo,
@@ -35,6 +36,7 @@ use reth_optimism_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
 use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
+use reth_optimism_payload_builder::error::OpPayloadBuilderError;
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_primitives_traits::RecoveredBlock;
@@ -49,9 +51,9 @@ use reth_transaction_pool::TransactionPool;
 use reth_trie::{HashedPostState, updates::TrieUpdates};
 use revm::Database;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Div, Rem},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tokio::sync::mpsc;
@@ -192,8 +194,11 @@ pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
     pub address_gas_limiter: AddressGasLimiter,
     /// Tokio task metrics for monitoring spawned tasks
     pub task_metrics: Arc<FlashblocksTaskMetrics>,
-    /// Sidecar client for cross-chain transactions
+    /// Sidecar client for XT inclusion confirmation callbacks.
     pub sidecar: crate::sidecar::SidecarClient,
+    /// Tracks speculative payload hashes back to the XT instances they contain
+    /// until the payload becomes canonical.
+    xt_canonical_tracker: Arc<Mutex<XtCanonicalTracker>>,
 }
 
 impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
@@ -224,6 +229,7 @@ impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
             address_gas_limiter,
             task_metrics,
             sidecar,
+            xt_canonical_tracker: Default::default(),
         }
     }
 }
@@ -527,10 +533,13 @@ where
             .map_err(|e| PayloadBuilderError::Other(e.into()))?;
 
         // Create best_transaction iterator
-        let mut best_txs = BestFlashblocksTxs::new(BestPayloadTransactions::new(
-            self.pool
-                .best_transactions_with_attributes(ctx.best_transaction_attributes()),
-        ));
+        let mut best_txs = BestFlashblocksTxs::new(
+            BestPayloadTransactions::new(
+                self.pool
+                    .best_transactions_with_attributes(ctx.best_transaction_attributes()),
+            ),
+            self.config.xt_pool.clone(),
+        );
         let interval = self.config.specific.interval;
         let (tx, rx) =
             std::sync::mpsc::sync_channel((self.config.flashblocks_per_block() + 1) as usize);
@@ -613,6 +622,7 @@ where
         }));
 
         // Process flashblocks - block on async channel receive
+        let mut cumulative_instance_ids = BTreeSet::new();
         loop {
             // Wait for signal before building flashblock.
             // If build_at_interval_end is false, an immediate signal is sent so we don't wait.
@@ -649,33 +659,41 @@ where
             }
 
             // Build flashblock after receiving signal
-            let next_flashblocks_ctx = match self.build_next_flashblock(
-                &ctx,
-                &mut info,
-                &mut state,
-                &state_provider,
-                &mut best_txs,
-                &block_cancel,
-                &best_payload,
-            ) {
-                Ok(Some(next_flashblocks_ctx)) => next_flashblocks_ctx,
-                Ok(None) => {
-                    self.record_flashblocks_metrics(&ctx, &info, flashblocks_per_block, &span);
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(
-                        target: "payload_builder",
-                        "Failed to build flashblock {} for block number {}: {}",
-                        ctx.flashblock_index(),
-                        ctx.block_number(),
-                        err
-                    );
-                    return Err(PayloadBuilderError::Other(err.into()));
-                }
-            };
+            let (next_flashblocks_ctx, candidate_block_hash, newly_executed_instance_ids) =
+                match self.build_next_flashblock(
+                    &ctx,
+                    &mut info,
+                    &mut state,
+                    &state_provider,
+                    &mut best_txs,
+                    &block_cancel,
+                    &best_payload,
+                ) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        self.record_flashblocks_metrics(&ctx, &info, flashblocks_per_block, &span);
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        error!(
+                            target: "payload_builder",
+                            "Failed to build flashblock {} for block number {}: {}",
+                            ctx.flashblock_index(),
+                            ctx.block_number(),
+                            err
+                        );
+                        return Err(PayloadBuilderError::Other(err.into()));
+                    }
+                };
 
             ctx = ctx.with_extra_ctx(next_flashblocks_ctx);
+            cumulative_instance_ids.extend(newly_executed_instance_ids);
+            if !cumulative_instance_ids.is_empty() {
+                self.xt_canonical_tracker
+                    .lock()
+                    .expect("xt canonical tracker poisoned")
+                    .record_candidate(candidate_block_hash, &cumulative_instance_ids);
+            }
         }
     }
 
@@ -692,7 +710,7 @@ where
         best_txs: &mut NextBestFlashblocksTxs<Pool>,
         block_cancel: &CancellationToken,
         best_payload: &BlockCell<OpBuiltPayload>,
-    ) -> eyre::Result<Option<FlashblocksExtraCtx>> {
+    ) -> eyre::Result<Option<(FlashblocksExtraCtx, B256, Vec<String>)>> {
         let flashblock_index = ctx.flashblock_index();
         let mut target_gas_for_batch = ctx.extra_ctx.target_gas_for_batch;
         let mut target_da_for_batch = ctx.extra_ctx.target_da_for_batch;
@@ -748,47 +766,181 @@ where
             *footprint = footprint.saturating_sub(builder_tx_da_size.saturating_mul(scalar as u64));
         }
 
-        // Execute pool transactions first. The sidecar poll is deferred until after the pool so
-        // state_overrides sent to sidecar reflect this flashblock's pool-tx effects.
-        let best_txs_start_time = Instant::now();
-        best_txs.refresh_iterator(
-            BestPayloadTransactions::new(
-                self.pool
-                    .best_transactions_with_attributes(ctx.best_transaction_attributes()),
-            ),
-            flashblock_index,
-        );
-        let transaction_pool_fetch_time = best_txs_start_time.elapsed();
-        ctx.metrics
-            .transaction_pool_fetch_duration
-            .record(transaction_pool_fetch_time);
-        ctx.metrics
-            .transaction_pool_fetch_gauge
-            .set(transaction_pool_fetch_time);
-
         let tx_execution_start_time = Instant::now();
-        let gas_before_sidecar = info.cumulative_gas_used;
-        ctx.execute_best_transactions(
-            info,
-            state,
-            best_txs,
-            target_gas_for_batch.min(ctx.block_gas_limit()),
-            target_da_for_batch,
-            target_da_footprint_for_batch,
-        )
-        .wrap_err("failed to execute best transactions")?;
-        // Extract last transactions
-        let new_transactions = info.executed_transactions[info.extra.last_flashblock_index..]
-            .to_vec()
-            .iter()
-            .map(|tx| tx.tx_hash())
-            .collect::<Vec<_>>();
-        best_txs.mark_commited(new_transactions);
+        let mut executed_xt_gate = ExecutedXtGateGuard::new(Arc::clone(&self.config.xt_pool));
 
-        // We got block cancelled, we won't need anything from the block at this point
-        // Caution: this assume that block cancel token only cancelled when new FCU is received
-        if block_cancel.is_cancelled() {
-            return Ok(None);
+        loop {
+            let mut made_progress = false;
+            let executed_before = info.executed_transactions.len();
+
+            // The pool gate is enforced per-tx inside `BestFlashblocksTxs::next`.
+            let best_txs_start_time = Instant::now();
+            best_txs.refresh_iterator(
+                BestPayloadTransactions::new(
+                    self.pool
+                        .best_transactions_with_attributes(ctx.best_transaction_attributes()),
+                ),
+                flashblock_index,
+            );
+            let transaction_pool_fetch_time = best_txs_start_time.elapsed();
+            ctx.metrics
+                .transaction_pool_fetch_duration
+                .record(transaction_pool_fetch_time);
+            ctx.metrics
+                .transaction_pool_fetch_gauge
+                .set(transaction_pool_fetch_time);
+
+            ctx.execute_best_transactions(
+                info,
+                state,
+                best_txs,
+                target_gas_for_batch.min(ctx.block_gas_limit()),
+                target_da_for_batch,
+                target_da_footprint_for_batch,
+            )
+            .wrap_err("failed to execute best transactions")?;
+
+            let new_transactions = info.executed_transactions[executed_before..]
+                .iter()
+                .map(|tx| tx.tx_hash())
+                .collect::<Vec<_>>();
+            if !new_transactions.is_empty() {
+                best_txs.mark_commited(new_transactions);
+                made_progress = true;
+            }
+
+            // We got block cancelled, we won't need anything from the block at this point
+            // Caution: this assume that block cancel token only cancelled when new FCU is received
+            if block_cancel.is_cancelled() {
+                return Ok(None);
+            }
+
+            let active_senders = self.config.xt_pool.active_senders();
+            if !active_senders.is_empty() {
+                let mut current_nonces = HashMap::with_capacity(active_senders.len());
+                for sender in active_senders {
+                    let nonce = state
+                        .load_cache_account(sender)
+                        .map(|account| account.account_info().unwrap_or_default().nonce)
+                        .map_err(|_| {
+                            PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
+                                sender,
+                            ))
+                        })?;
+                    current_nonces.insert(sender, nonce);
+                }
+
+                let executable_instance = self
+                    .config
+                    .xt_pool
+                    .collect_executable_instances(&current_nonces)
+                    .into_iter()
+                    .next();
+
+                if executable_instance.is_none() {
+                    if let Some(blocked) = self
+                        .config
+                        .xt_pool
+                        .first_blocked_instance_reason(&current_nonces)
+                    {
+                        info!(
+                            target: "payload_builder",
+                            instance_id = %blocked.instance_id,
+                            sender = ?blocked.sender,
+                            phase = blocked.phase,
+                            status = blocked.status,
+                            tx_index = blocked.tx_index,
+                            entry_nonce = blocked.entry_nonce,
+                            current_nonce = ?blocked.current_nonce,
+                            ?blocked.tx_hash,
+                            reason = blocked.reason,
+                            "Ethera XT instance is not executable in current flashblock state"
+                        );
+                    }
+                }
+
+                if let Some(xt_instance) = executable_instance {
+                    info!(
+                        target: "payload_builder",
+                        instance_id = %xt_instance.instance_id,
+                        tx_count = xt_instance.transactions.len(),
+                        sender_count = xt_instance.senders.len(),
+                        "Selected Ethera XT instance for flashblock execution"
+                    );
+                    if ctx.xt_instance_fits(
+                        info,
+                        &xt_instance,
+                        target_gas_for_batch.min(ctx.block_gas_limit()),
+                        target_da_for_batch,
+                        target_da_footprint_for_batch,
+                    )? {
+                        ctx.execute_xt_transactions(info, state, &xt_instance)
+                            .wrap_err_with(|| {
+                                format!(
+                                    "committed XT instance {} failed during flashblock execution",
+                                    xt_instance.instance_id
+                                )
+                            })?;
+                        // Lift the pool gate now that the executor's post-state
+                        // includes this XT. Independent of canonical
+                        // `mark_included` so that the gate is not held across
+                        // reorg-driven status rewinds.
+                        executed_xt_gate.note_executed(xt_instance.instance_id.clone());
+                        info!(
+                            target: "payload_builder",
+                            instance_id = %xt_instance.instance_id,
+                            "Executed Ethera XT instance in candidate flashblock and queued canonical tracking"
+                        );
+                        made_progress = true;
+
+                        // Ethera: drain pool txs from XT senders that are now unblocked.
+                        // The pool uses canonical chain nonces so txs whose nonce just became
+                        // reachable due to this XT executing mid-block appear "queued" (not
+                        // "pending") and won't be returned by best_transactions_with_attributes.
+                        // Executing them here keeps the nonce chain live so the next XT in this
+                        // sender's sequence can execute within the same flashblock.
+                        let gas_limit = target_gas_for_batch.min(ctx.block_gas_limit());
+                        for &sender in &xt_instance.senders {
+                            let evm_nonce = state
+                                .load_cache_account(sender)
+                                .map(|acct| acct.account_info().unwrap_or_default().nonce)
+                                .map_err(|_| {
+                                    PayloadBuilderError::other(
+                                        OpPayloadBuilderError::AccountLoadFailed(sender),
+                                    )
+                                })?;
+
+                            let mut queued = self.pool.get_queued_transactions_by_sender(sender);
+                            queued.sort_by_key(|tx| tx.nonce());
+                            let consecutive: Vec<_> = queued
+                                .into_iter()
+                                .scan(evm_nonce, |expected, tx| {
+                                    if tx.nonce() == *expected {
+                                        *expected += 1;
+                                        Some(tx)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            let committed = ctx.execute_unblocked_pool_txs(
+                                info,
+                                state,
+                                &consecutive,
+                                gas_limit,
+                            )?;
+                            if !committed.is_empty() {
+                                best_txs.mark_commited(committed);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !made_progress {
+                break;
+            }
         }
 
         let payload_transaction_simulation_time = tx_execution_start_time.elapsed();
@@ -798,71 +950,6 @@ where
         ctx.metrics
             .payload_transaction_simulation_gauge
             .set(payload_transaction_simulation_time);
-
-        // Poll sidecar for cross-chain transactions.
-        let pool_gas_used = info.cumulative_gas_used.saturating_sub(gas_before_sidecar);
-        let state_overrides = if self.sidecar.is_enabled() {
-            let overrides = crate::sidecar::build_state_overrides(state);
-            match overrides.as_object() {
-                Some(map) if map.is_empty() => None,
-                Some(_) => Some(overrides),
-                None => None,
-            }
-        } else {
-            None
-        };
-        let poll_request = crate::sidecar::PollRequest {
-            chain_id: ctx.chain_id(),
-            block_number: ctx.block_number(),
-            flashblock_index,
-            state_root: ctx.parent().header().state_root,
-            timestamp: ctx.timestamp(),
-            gas_limit: target_gas_for_batch.saturating_sub(pool_gas_used),
-            state_overrides,
-        };
-        let sidecar_poll = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.sidecar.poll_transactions(&poll_request))
-        });
-        match sidecar_poll {
-            Ok(Some(external_txs)) if !external_txs.is_empty() => {
-                let sidecar_tx_count = external_txs.len();
-                let sidecar_required_count = external_txs.iter().filter(|tx| tx.required).count();
-
-                if let Err(err) = ctx.execute_sidecar_transactions(
-                    info,
-                    state,
-                    external_txs,
-                    target_gas_for_batch.min(ctx.block_gas_limit()),
-                    target_da_for_batch,
-                    target_da_footprint_for_batch,
-                ) {
-                    error!(
-                        target: "payload_builder",
-                        chain_id = ctx.chain_id(),
-                        block_number = ctx.block_number(),
-                        flashblock_index,
-                        sidecar_tx_count,
-                        sidecar_required_count,
-                        err = %err,
-                        err_debug = ?err,
-                        "failed while executing sidecar transactions"
-                    );
-                    return Err(err).wrap_err("failed to execute sidecar transactions");
-                }
-            }
-            Ok(_) => {}
-            Err(err) => {
-                warn!(
-                    target: "payload_builder",
-                    chain_id = ctx.chain_id(),
-                    block_number = ctx.block_number(),
-                    flashblock_index,
-                    err = %err,
-                    "sidecar poll failed, continuing without external transactions"
-                );
-            }
-        }
 
         if let Err(e) = self
             .builder_tx
@@ -894,19 +981,22 @@ where
             Ok((new_payload, mut fb_payload)) => {
                 fb_payload.index = flashblock_index;
                 fb_payload.base = None;
+                let candidate_block_hash = new_payload.block().hash();
 
                 // If main token got canceled in here that means we received get_payload and we should drop everything and now update best_payload
                 // To ensure that we will return same blocks as rollup-boost (to leverage caches)
                 if block_cancel.is_cancelled() {
                     return Ok(None);
                 }
-                let flashblock_byte_size = self
-                    .ws_pub
-                    .publish(&fb_payload)
-                    .wrap_err("failed to publish flashblock via websocket")?;
-                self.payload_tx
-                    .try_send(new_payload.clone())
-                    .wrap_err("failed to send built payload to handler")?;
+                let flashblock_byte_size = match self.ws_pub.publish(&fb_payload) {
+                    Ok(size) => size,
+                    Err(err) => {
+                        return Err(err).wrap_err("failed to publish flashblock via websocket");
+                    }
+                };
+                if let Err(err) = self.payload_tx.try_send(new_payload.clone()) {
+                    return Err(err).wrap_err("failed to send built payload to handler");
+                }
                 best_payload.set(new_payload);
 
                 // Record flashblock build duration
@@ -956,7 +1046,12 @@ where
                     target_flashblocks = ctx.target_flashblock_count(),
                 );
 
-                Ok(Some(next_extra_ctx))
+                let newly_executed_instance_ids = executed_xt_gate.disarm();
+                Ok(Some((
+                    next_extra_ctx,
+                    candidate_block_hash,
+                    newly_executed_instance_ids,
+                )))
             }
         }
     }
@@ -1231,6 +1326,21 @@ where
         best_payload: BlockCell<Self::BuiltPayload>,
     ) -> Result<(), PayloadBuilderError> {
         self.build_payload(args, best_payload)
+    }
+
+    fn on_new_canonical_block(&self, block_hash: B256) {
+        let instance_ids = self
+            .xt_canonical_tracker
+            .lock()
+            .expect("xt canonical tracker poisoned")
+            .take_confirmed(block_hash);
+
+        if instance_ids.is_empty() {
+            return;
+        }
+
+        self.config.xt_pool.mark_included(&instance_ids);
+        self.sidecar.confirm_included(instance_ids);
     }
 }
 

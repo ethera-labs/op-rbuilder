@@ -4,10 +4,12 @@ use reth_optimism_rpc::OpEthApiBuilder;
 use crate::{
     args::*,
     builders::{BuilderConfig, BuilderMode, FlashblocksBuilder, PayloadBuilder, StandardBuilder},
+    ethera::{EtheraControlApiServer, EtheraEthApiServer, EtheraRpcExt},
     metrics::{VERSION, record_flag_gauge_metrics},
     monitor_tx_pool::monitor_tx_pool,
     primitives::reth::engine_api_builder::OpEngineApiBuilder,
     revert_protection::{EthApiExtServer, RevertProtectionExt},
+    sidecar::{SidecarClient, SidecarConfig},
     tx::FBPooledTransaction,
 };
 use core::fmt::Debug;
@@ -105,6 +107,12 @@ where
 
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
+        let xt_pool = builder_config.xt_pool.clone();
+        let sidecar_config = SidecarConfig::from(&builder_args.flashblocks.sidecar);
+        if sidecar_config.permissions_enabled && !sidecar_config.is_enabled() {
+            eyre::bail!("sidecar.permissions-enabled requires sidecar.endpoint");
+        }
+        let permission_client = SidecarClient::for_permissions(&sidecar_config);
         let rollup_args = builder_args.rollup_args;
         let op_node = OpNode::new(rollup_args.clone());
         let reverted_cache = Cache::builder().max_capacity(100).build();
@@ -148,6 +156,18 @@ where
             )
             .with_add_ons(addons)
             .extend_rpc_modules(move |ctx| {
+                let ethera_ext = EtheraRpcExt::new(
+                    xt_pool.clone(),
+                    ctx.pool().clone(),
+                    ctx.registry.eth_api().clone(),
+                    permission_client.clone(),
+                );
+                let mut ethera_rpc = EtheraEthApiServer::into_rpc(ethera_ext.clone());
+                ethera_rpc
+                    .merge(EtheraControlApiServer::into_rpc(ethera_ext))
+                    .map_err(eyre::Report::from)?;
+                ctx.modules.add_or_replace_configured(ethera_rpc)?;
+
                 if builder_args.enable_revert_protection {
                     tracing::info!("Revert protection enabled");
 

@@ -1,6 +1,7 @@
 use crate::{
     args::OpRbuilderArgs,
     builders::{BuilderConfig, FlashblocksBuilder, PayloadBuilder, StandardBuilder},
+    ethera::{EtheraControlApiServer, EtheraEthApiServer, EtheraRpcExt},
     primitives::reth::engine_api_builder::OpEngineApiBuilder,
     revert_protection::{EthApiExtServer, RevertProtectionExt},
     tests::{
@@ -113,6 +114,7 @@ impl LocalInstance {
             .expect("Failed to convert rollup args to builder config");
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
+        let xt_pool = builder_config.xt_pool.clone();
 
         let addons: OpAddOns<
             _,
@@ -138,6 +140,18 @@ impl LocalInstance {
             )
             .with_add_ons(addons)
             .extend_rpc_modules(move |ctx| {
+                let ethera_ext = EtheraRpcExt::new(
+                    xt_pool.clone(),
+                    ctx.pool().clone(),
+                    ctx.registry.eth_api().clone(),
+                    None,
+                );
+                let mut ethera_rpc = EtheraEthApiServer::into_rpc(ethera_ext.clone());
+                ethera_rpc
+                    .merge(EtheraControlApiServer::into_rpc(ethera_ext))
+                    .map_err(eyre::Report::from)?;
+                ctx.modules.add_or_replace_configured(ethera_rpc)?;
+
                 if args.enable_revert_protection {
                     tracing::info!("Revert protection enabled");
 

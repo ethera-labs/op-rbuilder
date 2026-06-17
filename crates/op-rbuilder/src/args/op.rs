@@ -217,7 +217,7 @@ pub struct FlashblocksArgs {
     )]
     pub ws_subscriber_limit: Option<u16>,
 
-    /// Compose sidecar configuration
+    /// Ethera sidecar callback configuration
     #[command(flatten)]
     pub sidecar: SidecarArgs,
 }
@@ -295,17 +295,15 @@ pub struct TelemetryArgs {
     pub sampling_ratio: u64,
 }
 
-/// Configuration for compose sidecar integration.
-/// When enabled, the builder polls the sidecar for cross-chain transactions
-/// at each flashblock boundary.
+/// Configuration for Ethera sidecar callbacks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
 pub struct SidecarArgs {
-    /// HTTP endpoint of the compose sidecar (e.g., "http://localhost:8082").
-    /// If empty, sidecar integration is disabled.
+    /// HTTP endpoint of the Ethera sidecar (e.g., "http://localhost:8082").
+    /// If empty, sidecar callbacks are disabled.
     #[arg(long = "sidecar.endpoint", env = "SIDECAR_ENDPOINT")]
     pub endpoint: Option<String>,
 
-    /// Timeout in milliseconds for sidecar poll requests.
+    /// Timeout in milliseconds for sidecar callback requests.
     #[arg(
         long = "sidecar.poll-timeout-ms",
         env = "SIDECAR_POLL_TIMEOUT_MS",
@@ -313,11 +311,21 @@ pub struct SidecarArgs {
     )]
     pub poll_timeout_ms: u64,
 
-    /// Maximum number of retries when sidecar returns hold response.
+    /// Maximum number of retries when a sidecar callback request fails.
     #[arg(
         long = "sidecar.max-retries",
         env = "SIDECAR_MAX_RETRIES",
         default_value = "5"
     )]
     pub max_retries: u32,
+
+    /// Gate transaction admission on the sidecar permission check (UC1/UC2).
+    /// When enabled, `eth_sendRawTransaction` fails closed if the sidecar
+    /// rejects the sender or is unreachable.
+    #[arg(
+        long = "sidecar.permissions-enabled",
+        env = "SIDECAR_PERMISSIONS_ENABLED",
+        default_value = "false"
+    )]
+    pub permissions_enabled: bool,
 }

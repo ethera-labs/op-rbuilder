@@ -1,93 +1,36 @@
-//! Types for sidecar communication.
+//! Types for builder-to-sidecar callbacks.
 
-use alloy_primitives::{Bytes, B256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Errors that can occur during sidecar communication and transaction execution.
+/// Errors that can occur while calling back into the sidecar.
 #[derive(Debug, Error)]
 pub enum SidecarError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-
-    #[error("Sidecar returned hold but max retries ({max_retries}) exceeded")]
-    HoldTimeout { max_retries: u32 },
-
-    #[error("Sidecar endpoint not configured")]
-    NotConfigured,
-
-    #[error("Failed to decode required sidecar transaction: {0}")]
-    DecodeError(String),
-
-    #[error("Required sidecar transaction signature recovery failed")]
-    SignatureRecoveryFailed,
-
-    #[error("Required sidecar transaction cannot be deposit or blob")]
-    InvalidTransactionType,
-
-    #[error("Required sidecar transaction exceeds block limits: {0}")]
-    LimitsExceeded(String),
-
-    #[error("Required sidecar transaction execution failed: {0}")]
-    ExecutionFailed(String),
-
-    #[error("Required sidecar transaction reverted: {0}")]
-    TransactionReverted(String),
 }
 
-/// Request sent to the sidecar when polling for transactions.
+/// Request sent to the sidecar after XT transactions are included.
 #[derive(Debug, Clone, Serialize)]
-pub struct PollRequest {
-    /// Chain ID of this rollup.
-    pub chain_id: u64,
-
-    /// Current block number being built.
-    pub block_number: u64,
-
-    /// Index of the flashblock within the current block (0-indexed).
-    pub flashblock_index: u64,
-
-    /// State root of the parent block.
-    pub state_root: B256,
-
-    /// Timestamp of the block being built.
-    pub timestamp: u64,
-
-    /// Gas limit available for this flashblock.
-    pub gas_limit: u64,
-
-    /// Optional state overrides representing the in-progress builder state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_overrides: Option<serde_json::Value>,
+pub struct ConfirmIncludedRequest {
+    pub instance_ids: Vec<String>,
 }
 
-/// Response from the sidecar when polling for transactions.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PollResponse {
-    /// If true, the builder should wait and retry.
-    pub hold: bool,
-
-    /// Milliseconds to wait before retrying (when hold is true).
-    #[serde(default)]
-    pub poll_after_ms: Option<u64>,
-
-    /// Transactions to include in the block.
-    #[serde(default)]
-    pub transactions: Vec<ExternalTransaction>,
+/// Request asking the sidecar to authorize a single transaction before it is
+/// admitted to the pool (UC1 native send, UC2 contract deploy).
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckTxRequest {
+    pub from: String,
+    pub is_create: bool,
+    pub has_value: bool,
 }
 
-/// A transaction received from the sidecar.
+/// Sidecar verdict for a [`CheckTxRequest`].
 #[derive(Debug, Clone, Deserialize)]
-pub struct ExternalTransaction {
-    /// RLP-encoded transaction bytes.
-    pub raw: Bytes,
-
-    /// If true, this transaction MUST be included or the block build fails.
-    /// If false, the transaction is optional and can be skipped on failure.
+pub struct CheckTxResponse {
+    pub allowed: bool,
     #[serde(default)]
-    pub required: bool,
-
-    /// Optional instance ID for tracking cross-chain transaction coordination.
+    pub reason: Option<String>,
     #[serde(default)]
-    pub instance_id: Option<String>,
+    pub config_version: Option<u64>,
 }
