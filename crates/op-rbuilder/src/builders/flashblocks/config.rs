@@ -137,11 +137,7 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
             p2p_known_peers: args.flashblocks.p2p.p2p_known_peers,
             p2p_max_peer_count: args.flashblocks.p2p.p2p_max_peer_count,
             ws_subscriber_limit: args.flashblocks.ws_subscriber_limit,
-            sidecar: SidecarConfig {
-                endpoint: args.flashblocks.sidecar.endpoint.unwrap_or_default(),
-                request_timeout: Duration::from_millis(args.flashblocks.sidecar.poll_timeout_ms),
-                max_retries: args.flashblocks.sidecar.max_retries,
-            },
+            sidecar: SidecarConfig::from(&args.flashblocks.sidecar),
         })
     }
 }

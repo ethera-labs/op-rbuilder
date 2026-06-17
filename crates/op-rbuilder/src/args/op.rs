@@ -318,4 +318,14 @@ pub struct SidecarArgs {
         default_value = "5"
     )]
     pub max_retries: u32,
+
+    /// Gate transaction admission on the sidecar permission check (UC1/UC2).
+    /// When enabled, `eth_sendRawTransaction` fails closed if the sidecar
+    /// rejects the sender or is unreachable.
+    #[arg(
+        long = "sidecar.permissions-enabled",
+        env = "SIDECAR_PERMISSIONS_ENABLED",
+        default_value = "false"
+    )]
+    pub permissions_enabled: bool,
 }
