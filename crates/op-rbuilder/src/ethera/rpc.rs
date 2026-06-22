@@ -160,6 +160,7 @@ where
                     recovered.signer(),
                     recovered.to().is_none(),
                     !recovered.value().is_zero(),
+                    signed.tx_hash(),
                 )
                 .await
                 .map_err(|err| {
