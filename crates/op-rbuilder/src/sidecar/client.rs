@@ -4,7 +4,7 @@ use super::{
     config::SidecarConfig,
     types::{CheckTxRequest, CheckTxResponse, ConfirmIncludedRequest, SidecarError},
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use reqwest::Client;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -85,6 +85,7 @@ impl SidecarClient {
         from: Address,
         is_create: bool,
         has_value: bool,
+        tx_hash: B256,
     ) -> Result<CheckTxResponse, SidecarError> {
         let Some(check) = &self.check else {
             return Ok(CheckTxResponse {
@@ -95,9 +96,10 @@ impl SidecarClient {
         };
 
         let request = CheckTxRequest {
-            from: format!("{from:#x}"),
+            from,
             is_create,
             has_value,
+            tx_hash,
         };
         let response = check
             .client

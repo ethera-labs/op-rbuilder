@@ -1,5 +1,6 @@
 //! Types for builder-to-sidecar callbacks.
 
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -17,12 +18,13 @@ pub struct ConfirmIncludedRequest {
 }
 
 /// Request asking the sidecar to authorize a single transaction before it is
-/// admitted to the pool (UC1 native send, UC2 contract deploy).
+/// admitted to the pool.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckTxRequest {
-    pub from: String,
+    pub from: Address,
     pub is_create: bool,
     pub has_value: bool,
+    pub tx_hash: B256,
 }
 
 /// Sidecar verdict for a [`CheckTxRequest`].
